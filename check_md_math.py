@@ -16,7 +16,7 @@ on GitHub:
    becomes ``\\bigl{`` — the last produces a hard "Missing or unrecognized
    delimiter for \\bigl" error; the others corrupt spacing silently.
 
-   Fenced ``\`\`\`math`` blocks are **exempt** from this strip (verified
+   Fenced ``\\`\\`\\`math`` blocks are **exempt** from this strip (verified
    empirically), so the GFM pass is only applied to ``$...$`` and
    ``$$...$$`` expressions. The render passes likewise feed fenced content
    to the engines verbatim, while dollar-delimited content is stripped first.
@@ -45,7 +45,7 @@ Run as a CLI from the repository root::
     python check_md_math.py docs/ README.md
 
 Math expressions are extracted from ``$...$`` inline math, ``$$...$$``
-display math, and ``\`\`\`math``-fenced display math.
+display math, and ``\\`\\`\\`math``-fenced display math.
 
 Exits 0 if clean, 1 if any issues found.
 """
@@ -87,7 +87,7 @@ def _blank_keep_newlines(match: re.Match) -> str:
 def strip_code(text: str) -> str:
     """Replace code regions with whitespace, preserving line numbers.
 
-    All fenced code blocks are blanked, including ``\`\`\`math``; the
+    All fenced code blocks are blanked, including ``\\`\\`\\`math``; the
     fenced-math contents are re-found by :func:`extract_fenced_math` so
     that the linter can track which math expressions came from a fenced
     block (exempt from GitHub's CommonMark backslash-strip — verified
@@ -162,7 +162,7 @@ _FENCED_MATH = re.compile(
 
 
 def extract_fenced_math(text: str) -> list[MathExpr]:
-    """Return every ``\`\`\`math`` fenced block as a display-math
+    """Return every ``\\`\\`\\`math`` fenced block as a display-math
     expression tagged ``source="fenced"``.
 
     Operates on the *raw* text (not the code-stripped form), since
@@ -244,7 +244,7 @@ def static_scan(expr: str) -> list[str]:
 #     letter-named forms ``\thickspace`` and ``\medspace`` are not defined
 #     in MathJax 3 base+ams and render as raw text on GitHub.
 #   * **Doubled backslash** — universal: ``\\;`` is parsed by CommonMark
-#     as escaped-backslash (``\``) followed by literal ``;``, leaving
+#     as escaped-backslash (``\\``) followed by literal ``;``, leaving
 #     ``\;`` for MathJax. Works for every short form because the underlying
 #     short forms are all in MathJax's base package.
 #
