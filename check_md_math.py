@@ -9,17 +9,25 @@ on GitHub:
    ``\\href``). These cause a visible "macro is not allowed" error in the
    rendered page.
 
-2. **GFM** — backslash-escaped TeX shortcuts that GitHub's *markdown*
-   preprocessor strips before the math is handed to MathJax, because
-   CommonMark treats ``\\X`` (where X is ASCII punctuation) as an escape.
-   ``\\,`` becomes a literal comma, ``\\!`` a literal bang, ``\\bigl\\{``
-   becomes ``\\bigl{`` — the last produces a hard "Missing or unrecognized
-   delimiter for \\bigl" error; the others corrupt spacing silently.
+2. **GFM** — corruption introduced by GitHub's markdown sanitiser before
+   the math is handed to MathJax. Two distinct failure modes are covered:
 
-   Fenced ``\\`\\`\\`math`` blocks are **exempt** from this strip (verified
-   empirically), so the GFM pass is only applied to ``$...$`` and
-   ``$$...$$`` expressions. The render passes likewise feed fenced content
-   to the engines verbatim, while dollar-delimited content is stripped first.
+   * CommonMark backslash-strip: ``\\X`` (where X is ASCII punctuation) is
+     rewritten as literal X inside math. ``\\,`` becomes a literal comma,
+     ``\\!`` a literal bang, ``\\bigl\\{`` becomes ``\\bigl{`` — the last
+     produces a hard "Missing or unrecognized delimiter for \\bigl" error;
+     the others corrupt spacing silently.
+   * The ``}_{`` emphasis-trap: when an underscore follows ``}`` inside an
+     inline ``$...$`` region, CommonMark's emphasis rule fires before
+     MathJax claims the region as math. The underscore is eaten and the
+     surrounding ``$``s render as literal text. See community discussion
+     65772 and 41087.
+
+   Both failure modes are skipped for fenced ``\\`\\`\\`math`` blocks and
+   for the alternative inline syntax ``$\\`...\\`$`` (backtick-dollar) —
+   both forms are exempt from CommonMark inline processing on GitHub.
+   The render passes likewise feed protected content to the engines
+   verbatim, while dollar-delimited content is stripped first.
 
 3. **Structural** — multi-line ``$$...$$`` blocks placed inside a list item.
    GitHub's markdown preprocessor silently fails to recognise these as math,
@@ -44,8 +52,9 @@ Run as a CLI from the repository root::
 
     python check_md_math.py docs/ README.md
 
-Math expressions are extracted from ``$...$`` inline math, ``$$...$$``
-display math, and ``\\`\\`\\`math``-fenced display math.
+Math expressions are extracted from ``$...$`` and ``$$...$$``
+dollar-delimited math, ``\\`\\`\\`math``-fenced display math, and the
+``$\\`...\\`$`` backtick-dollar inline form.
 
 Exits 0 if clean, 1 if any issues found.
 """
@@ -107,12 +116,18 @@ _BLOCK_MATH = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _INLINE_MATH = re.compile(
     r"(?<![\\$])"    # opening $ not after \ or another $
     r"\$"
-    r"(?![ \t\n$])"  # not followed by whitespace or another $
+    r"(?![ \t\n$`])"  # not followed by whitespace, $, or backtick
     r"([^\n$]+?)"    # body: no newlines, no $
     r"(?<![ \t])"    # last char not whitespace
     r"\$"
     r"(?![0-9$])"    # not followed by a digit (e.g. $5) or another $
 )
+# GitHub-specific inline math syntax: $`...`$. The backticks protect the
+# content from CommonMark's inline processing (emphasis markers, escapes),
+# making this form robust to the `}_{` trap and other markdown-sanitiser
+# corruption that plain $...$ is subject to. Documented at
+# https://github.blog/changelog/2023-05-08-new-delimiter-syntax-for-inline-mathematical-expressions/
+_INLINE_MATH_BACKTICK = re.compile(r"\$`([^`\n]+?)`\$")
 
 
 @dataclass
@@ -121,7 +136,10 @@ class MathExpr:
     expr: str
     line: int
     start: int
-    source: str = "dollar"  # "dollar" ($... / $$...) or "fenced" (```math)
+    source: str = "dollar"
+    # "dollar"   — $...$ or $$...$$ (subject to GitHub's markdown sanitiser)
+    # "fenced"   — ```math (exempt — verified empirically)
+    # "backtick" — $`...`$ (exempt — backticks protect content from markdown)
 
 
 def _line_of(text: str, offset: int) -> int:
@@ -131,8 +149,15 @@ def _line_of(text: str, offset: int) -> int:
 def extract_math(stripped: str) -> list[MathExpr]:
     """Return every $-delimited math expression in the (code-stripped) text.
 
-    Both ``$...$`` and ``$$...$$`` are tagged with ``source="dollar"`` —
-    these forms are subject to GitHub's CommonMark backslash-strip.
+    Three flavours are recognised:
+
+    * ``$$...$$`` block math — tagged ``source="dollar"``, subject to
+      GitHub's CommonMark backslash-strip.
+    * ``$\\`...\\`$`` inline math — tagged ``source="backtick"``, exempt
+      from CommonMark inline processing because the backticks make the
+      content a code span as far as markdown is concerned.
+    * ``$...$`` inline math — tagged ``source="dollar"``, subject to
+      CommonMark backslash-strip and the ``}_{`` emphasis-trap.
     """
     out: list[MathExpr] = []
     masked = stripped
@@ -141,6 +166,15 @@ def extract_math(stripped: str) -> list[MathExpr]:
         out.append(MathExpr("display", m.group(1),
                              _line_of(stripped, m.start()), m.start(),
                              source="dollar"))
+        s, e = m.span()
+        masked = masked[:s] + _blank_keep_newlines(m) + masked[e:]
+
+    # Backtick-dollar inline math — find these *before* the plain $...$
+    # pass so the plain regex doesn't try to consume the $`...`$ form.
+    for m in _INLINE_MATH_BACKTICK.finditer(masked):
+        out.append(MathExpr("inline", m.group(1),
+                             _line_of(masked, m.start()), m.start(),
+                             source="backtick"))
         s, e = m.span()
         masked = masked[:s] + _blank_keep_newlines(m) + masked[e:]
 
@@ -293,6 +327,48 @@ def commonmark_strip(s: str) -> str:
     rather than rejecting valid post-strip forms.
     """
     return re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])", r"\1", s)
+
+
+# --------------------------------------------------------------------------- #
+# 4b. Emphasis-trap scan: `}_{` inside inline $...$ math.                     #
+# --------------------------------------------------------------------------- #
+# Per CommonMark, the underscore character is a candidate emphasis marker
+# when it has appropriate flanking. The rule is more restrictive than for
+# `*` (specifically to avoid eating snake_case identifiers), but it DOES
+# permit emphasis to open when `_` is preceded by punctuation. The closing
+# brace of a superscript or subscript (``}``) counts as punctuation, so a
+# sequence like ``V^{(2)}_{\vec q}`` triggers CommonMark to interpret
+# the underscore as the start of an italic span before MathJax has a
+# chance to claim the `$...$` region as math. The result on GitHub is
+# that the entire inline math fails to render and the underscore is
+# eaten — see community discussion 65772 and 41087.
+#
+# The robust fix is to wrap the affected inline math in the
+# ``$`...`$`` (backtick-dollar) syntax, which protects the content from
+# CommonMark inline processing entirely.
+
+def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
+    """Return a list of messages for emphasis-trap hits in an inline
+    ``$...$`` math expression.
+
+    Only applies to inline math; ``$$...$$`` block math is processed by
+    GitHub's parser as a different shape and is not affected by the
+    same emphasis-marker rule.
+    """
+    if mode != "inline":
+        return []
+    if "}_{" not in expr:
+        return []
+    return [
+        "Inline math contains `}_{` — GitHub's markdown preprocessor "
+        "interprets `_` preceded by `}` as the start of an italic span "
+        "and eats the underscore before MathJax sees the math. The "
+        "whole inline $...$ region typically fails to render. "
+        "Fix: switch this inline math to the backtick-dollar form "
+        "`$`...`$` (the backticks protect the content from CommonMark "
+        "inline processing). See "
+        "https://github.com/orgs/community/discussions/65772 ."
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -571,13 +647,13 @@ def scan_paths(paths: Iterable[Path],
             next_id += 1
             by_id[iid] = (md, me)
 
-            # For render, dollar-source content is fed through CommonMark
-            # strip first (matching what GitHub feeds MathJax). Fenced
-            # content is exempt and goes to the engines verbatim.
-            if me.source == "fenced":
-                render_expr = me.expr
-            else:
+            # For render: dollar-source content is fed through CommonMark
+            # strip first (matching what GitHub feeds MathJax). Fenced and
+            # backtick-protected content goes to the engines verbatim.
+            if me.source == "dollar":
                 render_expr = commonmark_strip(me.expr)
+            else:
+                render_expr = me.expr
 
             stripped_me = MathExpr(
                 mode=me.mode,
@@ -593,9 +669,10 @@ def scan_paths(paths: Iterable[Path],
             for hit in static_scan(me.expr):
                 issues.append(Issue(md, me.line, "STATIC", me.mode, me.expr, hit))
 
-            # GFM pass applies *only* to dollar-delimited math. Fenced
-            # blocks are not subject to CommonMark backslash-strip.
-            if me.source != "fenced":
+            # GFM and emphasis-trap passes apply *only* to dollar-delimited
+            # math. Both fenced ```math and $`...`$ forms are protected
+            # from GitHub's CommonMark inline processing.
+            if me.source == "dollar":
                 for pat, repl, fallback, desc, n in gfm_escape_scan(me.expr):
                     qty = "" if n == 1 else f" (×{n})"
                     if repl == fallback:
@@ -607,6 +684,8 @@ def scan_paths(paths: Iterable[Path],
                            f"leaving a literal `{pat[1]}` for MathJax. "
                            f"Replace with {suggestion}{qty}.")
                     issues.append(Issue(md, me.line, "GFM ", me.mode, me.expr, msg))
+                for hit in emphasis_trap_scan(me.expr, me.mode):
+                    issues.append(Issue(md, me.line, "GFM ", me.mode, me.expr, hit))
 
     if (run_katex or run_mathjax) and node_cwd is None:
         node_cwd = Path.cwd()

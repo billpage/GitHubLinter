@@ -17,7 +17,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 | Pass | Severity | Description |
 |------|----------|-------------|
 | **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. |
-| **GFM** | Error/Warning | Backslash-escaped TeX shortcuts that GitHub's CommonMark preprocessor strips *before* handing content to MathJax. `\,` becomes a literal comma; `\bigl\{` becomes `\bigl{`, which causes a hard delimiter error. Applies only to `$...$` / `$$...$$` — fenced ` ```math ` blocks are exempt. |
+| **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the `}_{` emphasis-trap (the underscore in `V^{(2)}_{\vec q}` is eaten as italic markup, breaking the math). Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
 | **Structural** | Error | Multi-line `$$...$$` blocks inside list items. GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
 | **MathJax** | Error | Same expressions through MathJax 3 with only `base` + `ams` packages — matching GitHub's actual config. Catches macros like `\thickspace` / `\medspace` that a full MathJax install would silently accept. |
@@ -232,6 +232,30 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   `bm` package is not loaded on GitHub).
 - **Inline math adjacent to digits**: `$x$5` can confuse GitHub's parser.
   A space — `$x$ 5` — avoids the problem entirely.
+- **Inline math with `}_{` (subscript right after a brace): wrap in
+  backtick-dollar.** GitHub's markdown preprocessor treats a `_`
+  preceded by `}` as the start of an italic span and eats the
+  underscore before MathJax sees the math. So `$V^{(2)}_{\vec q}$`
+  inside flowing prose renders as the literal string
+  `$V^{(2)}{\vec q}$` (underscore gone, dollar signs visible).
+  Reference: community discussion
+  [#65772](https://github.com/orgs/community/discussions/65772).
+
+  The fix is GitHub's documented alternative inline-math syntax,
+  `$`...`$` (backtick-dollar). The backticks make the content a
+  code span as far as markdown is concerned, so the inline emphasis
+  rule is skipped entirely. Rewrite:
+
+  | Don't write | Write instead |
+  | --- | --- |
+  | `$V^{(2)}_{\vec q}$` | `` $`V^{(2)}_{\vec q}`$ `` |
+  | `$\|\Gamma^{(2)}_{\vec q}\|/\hbar$` | `` $`\|\Gamma^{(2)}_{\vec q}\|/\hbar`$ `` |
+
+  Inline math without the `}_{` pattern (e.g. `$\vec r_{ij}$`,
+  `$V_2$`) is fine as plain `$...$`. Display math `$$...$$` is also
+  not affected by this rule.
+
+  The linter's GFM pass enforces this.
 - **Multi-line `$$...$$` outside lists**: fine and preferred for long
   derivations. The structural restriction applies only inside list items.
 
