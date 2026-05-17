@@ -17,11 +17,12 @@ on GitHub:
      ``\\!`` a literal bang, ``\\bigl\\{`` becomes ``\\bigl{`` — the last
      produces a hard "Missing or unrecognized delimiter for \\bigl" error;
      the others corrupt spacing silently.
-   * The ``}_{`` emphasis-trap: when an underscore follows ``}`` inside an
-     inline ``$...$`` region, CommonMark's emphasis rule fires before
-     MathJax claims the region as math. The underscore is eaten and the
-     surrounding ``$``s render as literal text. See community discussion
-     65772 and 41087.
+   * The ``}_`` emphasis-trap: when `_` follows `}` inside an
+     inline ``$...$`` region, CommonMark's emphasis rule fires
+     (``}`` is punctuation so the ``_`` is unconditionally
+     left-flanking). The underscore is eaten regardless of what
+     follows it -- ``}_q``, ``}_0``, ``}_{``, ``}_\\vec`` are all
+     broken. See community discussion 65772.
 
    Both failure modes are skipped for fenced ``\\`\\`\\`math`` blocks and
    for the alternative inline syntax ``$\\`...\\`$`` (backtick-dollar) —
@@ -330,22 +331,31 @@ def commonmark_strip(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 4b. Emphasis-trap scan: `}_{` inside inline $...$ math.                     #
+# 4b. Emphasis-trap scan: `}_` inside inline $...$ math.                      #
 # --------------------------------------------------------------------------- #
-# Per CommonMark, the underscore character is a candidate emphasis marker
-# when it has appropriate flanking. The rule is more restrictive than for
-# `*` (specifically to avoid eating snake_case identifiers), but it DOES
-# permit emphasis to open when `_` is preceded by punctuation. The closing
-# brace of a superscript or subscript (``}``) counts as punctuation, so a
-# sequence like ``V^{(2)}_{\vec q}`` triggers CommonMark to interpret
-# the underscore as the start of an italic span before MathJax has a
-# chance to claim the `$...$` region as math. The result on GitHub is
-# that the entire inline math fails to render and the underscore is
-# eaten — see community discussion 65772 and 41087.
+# Per CommonMark S6.1, an underscore is left-flanking (can open emphasis)
+# when it is followed by a non-whitespace character AND either not preceded
+# by a Unicode punctuation character, OR preceded by whitespace/punctuation.
+# A closing brace `}` IS punctuation, so `_` immediately after `}` is always
+# left-flanking AND satisfies the "preceded by punctuation" opening condition.
+# Therefore **any** sequence `}_X` (where X is non-whitespace) acts as an
+# emphasis opener inside inline $...$ math before MathJax can claim the
+# `$...$` region.  The character after `_` does not matter:
+#   `}_q`  (letter)   -- subscript variable name
+#   `}_0`  (digit)    -- subscript index
+#   `}_\`  (command)  -- subscript TeX macro
+#   `}_{`  (brace)    -- explicit subscript group
+# are all equally broken.  The result is that the underscore is eaten, the
+# surrounding `$...$` fails to render, and (due to cascading) other inline
+# math expressions later in the same paragraph also fail.
 #
-# The robust fix is to wrap the affected inline math in the
-# ``$`...`$`` (backtick-dollar) syntax, which protects the content from
-# CommonMark inline processing entirely.
+# Community discussion: https://github.com/orgs/community/discussions/65772
+#
+# The robust fix is the ``$`...`$`` (backtick-dollar) syntax.  Note that
+# any doubled-backslash spacing commands inside the expression (``\\,``,
+# ``\\;`` etc.) must be simplified to their single-backslash forms (``\,``,
+# ``\;``) inside the backtick-dollar region, because the backticks bypass
+# CommonMark so the doubling is no longer needed.
 
 def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
     """Return a list of messages for emphasis-trap hits in an inline
@@ -357,17 +367,21 @@ def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
     """
     if mode != "inline":
         return []
-    if "}_{" not in expr:
+    if not re.search(r"}_\S", expr):
         return []
     return [
-        "Inline math contains `}_{` — GitHub's markdown preprocessor "
-        "interprets `_` preceded by `}` as the start of an italic span "
-        "and eats the underscore before MathJax sees the math. The "
-        "whole inline $...$ region typically fails to render. "
-        "Fix: switch this inline math to the backtick-dollar form "
-        "`$`...`$` (the backticks protect the content from CommonMark "
-        "inline processing). See "
-        "https://github.com/orgs/community/discussions/65772 ."
+        "Inline math contains `}_` followed by a non-whitespace character "
+        "-- GitHub's markdown preprocessor interprets `_` preceded by `}` "
+        "(punctuation) as the start of an italic span regardless of what "
+        r"follows the `_` (`}_q`, `}_0`, `}_\\`, `}_{` are all broken). "
+        "The underscore is eaten and the whole $...$ region fails to render; "
+        "later inline math on the same paragraph line often fails too "
+        "(cascading). "
+        "Fix: wrap the expression in backtick-dollar form `$`...`$`. "
+        "If the expression contains doubled-backslash spacing such as "
+        r"`\\,` or `\\;`, simplify those to `\,` / `\;` "
+        "inside the backtick-dollar form (CommonMark no longer strips them). "
+        "See https://github.com/orgs/community/discussions/65772 ."
     ]
 
 
