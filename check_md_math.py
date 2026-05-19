@@ -421,8 +421,45 @@ def inverted_backtick_scan(text: str) -> list[tuple[int, str]]:
     return results
 
 
-
 # --------------------------------------------------------------------------- #
+# 4e. Hyphen-dollar scan: `-$...$` in raw markdown text.                      #
+# --------------------------------------------------------------------------- #
+# GitHub's math pipeline does not recognise the opening `$` as a math
+# delimiter when it is immediately preceded by a hyphen-minus (`-`).  This
+# mirrors the common practice of excluding `-$` to avoid ambiguity with
+# negative-value dollar signs such as `-$5`.  The result is that the `$`
+# is treated as a literal character and the whole expression fails to render.
+#
+# Example: `Fourier-in-$s$` -- the `$s$` never renders.
+# Fix: use the backtick-dollar form ``$`s`$``, which GitHub's parser
+# recognises as a distinct construct regardless of the preceding character.
+
+_HYPHEN_DOLLAR_MATH = re.compile(
+    r"-"
+    r"\$(?!`)"          # $ not already the start of the backtick-dollar form
+    r"(?![\s$])"        # standard opening condition: not followed by space / $
+    r"[^\n$]{1,120}"
+    r"(?<![\s])\$"
+    r"(?![0-9$`])"      # standard closing condition
+)
+
+
+def hyphen_dollar_scan(text: str) -> list[tuple[int, str]]:
+    """Scan raw markdown text for inline ``$...$`` math where the opening
+    ``$`` is immediately preceded by a hyphen, returning
+    ``(line_number, context)`` tuples.
+
+    GitHub's parser does not recognise the opening ``$`` as a math
+    delimiter in this position.
+    """
+    results = []
+    for m in _HYPHEN_DOLLAR_MATH.finditer(text):
+        ln = text.count("\n", 0, m.start()) + 1
+        results.append((ln, m.group()))
+    return results
+
+
+
 
 _LIST_ITEM_OPEN = re.compile(r"^(\s*)(?:[-+*]\s+|\d+[.)]\s+)")
 _BLANK_LINE = re.compile(r"^\s*$")
@@ -697,6 +734,19 @@ def scan_paths(paths: Iterable[Path],
                 "mathematical-expressions/ ."
             )
             issues.append(Issue(md, line, "STATIC", "inline", expr, msg))
+        for line, expr in hyphen_dollar_scan(text):
+            inner = expr[2:-1]
+            msg = (
+                f"Inline math `-{expr[1:]}` has `$` immediately preceded "
+                "by a hyphen. GitHub's math parser does not recognise the "
+                "opening `$` as a math delimiter in this position (the "
+                "`-$` sequence is excluded to avoid confusion with "
+                "negative-value dollar signs). "
+                f"Fix: use the backtick-dollar form: "
+                f"`-$`{inner}`$` -- the backtick-dollar construct "
+                "is recognised regardless of the preceding character."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
 
         stripped = strip_code(text)
 

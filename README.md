@@ -280,6 +280,21 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   even though it is inside a code span, so the code-span protection
   is not reliable. Use the correct form `$`...`$` instead.
   The linter's Static pass detects this.
+
+- **Inline math with `$` immediately preceded by a hyphen** (e.g.
+  `Fourier-in-$s$`, `-$N$`). GitHub's math parser excludes `$` as a
+  math delimiter when the preceding character is `-`, treating `-$`
+  as a negative-dollar sign rather than math. The `$...$` expression
+  simply fails to render.
+  Fix: use the backtick-dollar form `$`...`$` — it is recognised
+  regardless of the preceding character:
+
+  | Don't write | Write instead |
+  | --- | --- |
+  | `Fourier-in-$s$` | `Fourier-in-$`s`$` |
+  | `-$N$` | `-$`N`$` |
+
+  The linter's Static pass detects this.
 - **Multi-line `$$...$$` outside lists**: fine and preferred for long
   derivations. The structural restriction applies only inside list items.
 
