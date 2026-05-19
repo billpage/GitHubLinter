@@ -331,31 +331,31 @@ def commonmark_strip(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 4b. Emphasis-trap scan: `}_` inside inline $...$ math.                      #
+# 4b. Emphasis-trap scan: punctuation + `_` inside inline $...$ math.         #
 # --------------------------------------------------------------------------- #
-# Per CommonMark S6.1, an underscore is left-flanking (can open emphasis)
-# when it is followed by a non-whitespace character AND either not preceded
-# by a Unicode punctuation character, OR preceded by whitespace/punctuation.
-# A closing brace `}` IS punctuation, so `_` immediately after `}` is always
-# left-flanking AND satisfies the "preceded by punctuation" opening condition.
-# Therefore **any** sequence `}_X` (where X is non-whitespace) acts as an
-# emphasis opener inside inline $...$ math before MathJax can claim the
-# `$...$` region.  The character after `_` does not matter:
-#   `}_q`  (letter)   -- subscript variable name
-#   `}_0`  (digit)    -- subscript index
-#   `}_\`  (command)  -- subscript TeX macro
-#   `}_{`  (brace)    -- explicit subscript group
-# are all equally broken.  The result is that the underscore is eaten, the
-# surrounding `$...$` fails to render, and (due to cascading) other inline
-# math expressions later in the same paragraph also fail.
+# Per CommonMark S6.1, an underscore opens emphasis when it is left-flanking.
+# The rule permits emphasis to open when `_` is followed by non-whitespace AND
+# preceded by any Unicode punctuation character.  A closing brace `}` is the
+# most common trigger (subscript right after a group: `V^{(2)}_{\vec q}`), but
+# any ASCII punctuation before `_` is equally broken:
+#
+#   `}_q`, `}_0`, `}_{`  -- subscript after closing brace (most common)
+#   `'_i`, `'_m`, `'_{`  -- subscript after prime (x'_i, f'_{n})
+#   `)_n`, `|_{a}`       -- subscript after closing delimiter
+#
+# The result is that the underscore is eaten and the whole $...$ region
+# fails to render; later inline math on the same paragraph line often
+# fails too (cascading).
+#
+# Note: `_` preceded by an ordinary letter or digit is NOT left-flanking
+# by this rule, so `r_{ij}` and `\alpha_i` are safe.
+#
+# Fix: wrap the expression in backtick-dollar form ``$`...`$``.
+# Any doubled-backslash spacing (``\\,`` ``\\;``) must be simplified to
+# ``\,`` / ``\;`` inside the backtick-dollar region (CommonMark no longer
+# strips them).
 #
 # Community discussion: https://github.com/orgs/community/discussions/65772
-#
-# The robust fix is the ``$`...`$`` (backtick-dollar) syntax.  Note that
-# any doubled-backslash spacing commands inside the expression (``\\,``,
-# ``\\;`` etc.) must be simplified to their single-backslash forms (``\,``,
-# ``\;``) inside the backtick-dollar region, because the backticks bypass
-# CommonMark so the doubling is no longer needed.
 
 def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
     """Return a list of messages for emphasis-trap hits in an inline
@@ -367,26 +367,61 @@ def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
     """
     if mode != "inline":
         return []
-    if not re.search(r"}_\S", expr):
+    if not re.search(r"(?<=[^\w\s])_\S", expr):
         return []
+    m = re.search(r"(?<=[^\w\s])_\S", expr)
+    trigger = expr[max(0, m.start()-1):m.end()] if m else "_"
     return [
-        "Inline math contains `}_` followed by a non-whitespace character "
-        "-- GitHub's markdown preprocessor interprets `_` preceded by `}` "
-        "(punctuation) as the start of an italic span regardless of what "
-        r"follows the `_` (`}_q`, `}_0`, `}_\\`, `}_{` are all broken). "
-        "The underscore is eaten and the whole $...$ region fails to render; "
-        "later inline math on the same paragraph line often fails too "
-        "(cascading). "
-        "Fix: wrap the expression in backtick-dollar form `$`...`$`. "
-        "If the expression contains doubled-backslash spacing such as "
-        r"`\\,` or `\\;`, simplify those to `\,` / `\;` "
-        "inside the backtick-dollar form (CommonMark no longer strips them). "
+        f"Inline math contains `{trigger}` -- "
+        "GitHub's CommonMark preprocessor treats `_` preceded by "
+        "punctuation as an italic opener (CommonMark S6.1). "
+        "The underscore is eaten and the whole $...$ region fails to "
+        "render; later inline math in the same paragraph may cascade. "
+        "Common triggers: `}_{`, `}_q`, `}_0`, `'_i`, `'_{{`, `)_n`. "
+        "Fix: switch to backtick-dollar form `$`...`$`. "
+        r"Simplify any `\\,` / `\\;` spacing to `\,` / `\;` inside "
+        "the backtick-dollar form (CommonMark no longer strips them). "
         "See https://github.com/orgs/community/discussions/65772 ."
     ]
 
 
 # --------------------------------------------------------------------------- #
-# 5. Structural scan: block math placed inside a list item.                   #
+# 4c. Inverted-backtick scan: `` `$...$` `` in raw markdown text.             #
+# --------------------------------------------------------------------------- #
+# GitHub's math pipeline is applied before (or in parallel with) inline-code
+# processing in some contexts.  The result is that `` `$\mathbb{Z}_4$` ``
+# (backtick OUTSIDE the dollar signs) is still attempted as math rather than
+# rendered as plain code.  Because the content `\mathbb{Z}_4` contains `}_4`
+# (the emphasis trap), the math fails visually.
+#
+# The correct protected-math syntax is ``$`...`$`` (backtick INSIDE the
+# dollars).  This check detects the inverted form in the raw markdown text.
+
+_INVERTED_BACKTICK_MATH = re.compile(
+    r"(?<!\$)"       # leading ` not at the tail of a valid $`...`$ expression
+    r"`\$"           # backtick then dollar (inverted form)
+    r"(?![`.\s])"    # not followed by backtick, period, or whitespace
+    r"[^`\n]{1,120}"
+    r"\$`"
+    r"(?!\$)"        # trailing ` not at the head of the next $`...`$ expression
+)
+
+
+def inverted_backtick_scan(text: str) -> list[tuple[int, str]]:
+    """Scan raw markdown text for the inverted-backtick math pattern
+    `` `$...$` `` and return ``(line_number, expr)`` tuples.
+
+    This form is a common mistake when trying to protect inline math from
+    CommonMark processing.  The correct syntax is ``$`...`$``.
+    """
+    results = []
+    for m in _INVERTED_BACKTICK_MATH.finditer(text):
+        ln = text.count("\n", 0, m.start()) + 1
+        results.append((ln, m.group()))
+    return results
+
+
+
 # --------------------------------------------------------------------------- #
 
 _LIST_ITEM_OPEN = re.compile(r"^(\s*)(?:[-+*]\s+|\d+[.)]\s+)")
@@ -647,6 +682,21 @@ def scan_paths(paths: Iterable[Path],
         # structural pass works on the raw text
         for line, msg, snippet in list_item_block_math(text):
             issues.append(Issue(md, line, "STRUCT", "display", snippet, msg))
+        # inverted-backtick pass also works on raw text
+        for line, expr in inverted_backtick_scan(text):
+            msg = (
+                f"Found `{expr}` -- backtick OUTSIDE the dollar signs. "
+                "This is the inverted form of the protected-math syntax. "
+                "GitHub's math pipeline may still attempt to render "
+                "the content as math, bypassing the code-span protection. "
+                "Use the correct form: `$`...`$` (backtick INSIDE the "
+                "dollars), which is GitHub's documented inline-math syntax "
+                "that bypasses CommonMark emphasis processing. "
+                "See https://github.blog/changelog/"
+                "2023-05-08-new-delimiter-syntax-for-inline-"
+                "mathematical-expressions/ ."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", expr, msg))
 
         stripped = strip_code(text)
 

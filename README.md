@@ -17,7 +17,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 | Pass | Severity | Description |
 |------|----------|-------------|
 | **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. |
-| **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the `}_` emphasis-trap: `_` preceded by `}` opens italic regardless of what follows (`}_q`, `}_0`, `}_{`, `}_\cmd` are all broken). Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
+| **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Also adds a **Static** check for the inverted-backtick form `` `$...$` `` (backtick outside the dollars). Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
 | **Structural** | Error | Multi-line `$$...$$` blocks inside list items. GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
 | **MathJax** | Error | Same expressions through MathJax 3 with only `base` + `ams` packages — matching GitHub's actual config. Catches macros like `\thickspace` / `\medspace` that a full MathJax install would silently accept. |
@@ -232,13 +232,14 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   `bm` package is not loaded on GitHub).
 - **Inline math adjacent to digits**: `$x$5` can confuse GitHub's parser.
   A space — `$x$ 5` — avoids the problem entirely.
-- **Inline math with `}_` (subscript right after a brace): wrap in
+- **Inline math with `}_` or `'_` (subscript right after a brace or prime): wrap in
   backtick-dollar.** GitHub's markdown preprocessor treats any `_`
-  preceded by `}` as the start of an italic span — regardless of what
+  preceded by punctuation as the start of an italic span — regardless of what
   follows the `_`. All of `}_q` (letter), `}_0` (digit), `}_{`
-  (brace), and `}_\vec` (command) trigger the trap. The underscore is
-  eaten, the whole `$...$` fails to render, and other inline math
-  later in the same paragraph often cascades and breaks too.
+  (brace), `}_\vec` (command), and `'_i` (prime) trigger the trap.
+  The underscore is eaten, the whole `$...$` fails to render, and
+  other inline math later in the same paragraph often cascades and
+  breaks too.
   Reference: community discussion
   [#65772](https://github.com/orgs/community/discussions/65772).
 
@@ -252,17 +253,33 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   | `$V^{(2)}_{\vec q}$` | `` $`V^{(2)}_{\vec q}`$ `` |
   | `$\|\Gamma^{(2)}_q(r)\|$` | `` $`\|\Gamma^{(2)}_q(r)\|`$ `` |
   | `$W^{(2)}_0(x, p)$` | `` $`W^{(2)}_0(x, p)`$ `` |
+  | `$(X_i, X'_i)$` | `` $`(X_i, X'_i)`$ `` |
 
   **Important:** any doubled-backslash spacing such as `\\,` or `\\;`
   inside the expression must be simplified to `\,` / `\;` inside the
   backtick-dollar form, because the backticks bypass CommonMark's
   processing — the extra backslash is no longer needed.
 
-  Inline math without the `}_` pattern (e.g. `$\vec r_{ij}$`,
-  `$V_2$`) is fine as plain `$...$`. Display math `$$...$$` is also
-  not affected by this rule.
+  Inline math without a punctuation-then-underscore pattern (e.g.
+  `$\vec r_{ij}$`, `$V_2$`) is fine as plain `$...$`. Display
+  math `$$...$$` is also not affected by this rule.
 
   The linter's GFM pass enforces this.
+
+- **Inline math with two `^*` (complex conjugate) in the same paragraph.**
+  The `*` after `^` is left-flanking per CommonMark and can open
+  emphasis. If TWO `^*` expressions appear in the same paragraph,
+  the first opens an italic span and the second closes it, eating
+  both `$...$` regions between them. The fix is the same:
+  `$`...`$` for any expression containing `^*` when another
+  such expression is nearby. The linter does not yet detect this
+  automatically — watch for it manually.
+
+- **Inverted-backtick form `` `$...$` `` (backtick outside the dollars).**
+  GitHub's math pipeline may still attempt to render the content
+  even though it is inside a code span, so the code-span protection
+  is not reliable. Use the correct form `$`...`$` instead.
+  The linter's Static pass detects this.
 - **Multi-line `$$...$$` outside lists**: fine and preferred for long
   derivations. The structural restriction applies only inside list items.
 
