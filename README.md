@@ -17,7 +17,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 | Pass | Severity | Description |
 |------|----------|-------------|
 | **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. Also covers two preprocessor-level failures where `$...$` never reaches MathJax at all: an opening `$` glued to a hyphen or a quotation mark (`-$x$`, `"$x$`), and math sitting inside a single-delimiter emphasis span (`*text $x$ text*`) — GitHub renders markdown to HTML *before* scanning for `$...$`, so math inside the resulting `<em>` is never picked up. Both leave the dollar signs on the rendered page verbatim. |
-| **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Also adds a **Static** check for the inverted-backtick form `` `$...$` `` (backtick outside the dollars). Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
+| **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
 | **Structural** | Error | Multi-line `$$...$$` blocks inside list items. GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
 | **MathJax** | Error | Same expressions through MathJax 3 with only `base` + `ams` packages — matching GitHub's actual config. Catches macros like `\thickspace` / `\medspace` that a full MathJax install would silently accept. |
@@ -275,11 +275,16 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   such expression is nearby. The linter does not yet detect this
   automatically — watch for it manually.
 
-- **Inverted-backtick form `` `$...$` `` (backtick outside the dollars).**
-  GitHub's math pipeline may still attempt to render the content
-  even though it is inside a code span, so the code-span protection
-  is not reliable. Use the correct form `$`...`$` instead.
-  The linter's Static pass detects this.
+- **`` `$...$` `` (backtick outside the dollars) is actually fine.** An
+  earlier version of this linter flagged this as broken, on the theory
+  that GitHub's math pipeline could still reach inside a code span. Tested
+  directly against GitHub's live renderer (`api.github.com/markdown`,
+  `mode=gfm`) and found to be unfounded: a code span protects its content
+  completely, including content that contains the `}_` emphasis-trap
+  pattern from the bullet above. The check has been removed. If you've
+  seen this actually fail on a real page, please open an issue — that
+  would mean GitHub's behavior has changed since this was tested (July
+  2026), and the check should come back.
 
 - **Inline math with `$` immediately preceded by a hyphen or a quotation
   mark** (e.g. `Fourier-in-$s$`, `-$N$`, `"$x$ returns to zero,"`). GitHub's

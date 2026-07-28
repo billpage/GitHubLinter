@@ -395,39 +395,43 @@ def emphasis_trap_scan(expr: str, mode: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# 4c. Inverted-backtick scan: `` `$...$` `` in raw markdown text.             #
+# 4c. (Removed) "Inverted-backtick" check -- tested and found unfounded.      #
 # --------------------------------------------------------------------------- #
-# GitHub's math pipeline is applied before (or in parallel with) inline-code
-# processing in some contexts.  The result is that `` `$\mathbb{Z}_4$` ``
-# (backtick OUTSIDE the dollar signs) is still attempted as math rather than
-# rendered as plain code.  Because the content `\mathbb{Z}_4` contains `}_4`
-# (the emphasis trap), the math fails visually.
+# A prior version of this linter flagged `` `$...$` `` (backtick OUTSIDE the
+# dollar signs) as broken, on the theory that "GitHub's math pipeline is
+# applied before (or in parallel with) inline-code processing in some
+# contexts," so a code span wrapping dollar-shaped content would still be
+# reinterpreted as math -- and, worse, that content containing `}_` (the
+# emphasis-trap pattern) would fail visually even inside that code span.
 #
-# The correct protected-math syntax is ``$`...`$`` (backtick INSIDE the
-# dollars).  This check detects the inverted form in the raw markdown text.
-
-_INVERTED_BACKTICK_MATH = re.compile(
-    r"(?<!\$)"       # leading ` not at the tail of a valid $`...`$ expression
-    r"`\$"           # backtick then dollar (inverted form)
-    r"(?![`.\s])"    # not followed by backtick, period, or whitespace
-    r"[^`\n]{1,120}"
-    r"\$`"
-    r"(?!\$)"        # trailing ` not at the head of the next $`...`$ expression
-)
-
-
-def inverted_backtick_scan(text: str) -> list[tuple[int, str]]:
-    """Scan raw markdown text for the inverted-backtick math pattern
-    `` `$...$` `` and return ``(line_number, expr)`` tuples.
-
-    This form is a common mistake when trying to protect inline math from
-    CommonMark processing.  The correct syntax is ``$`...`$``.
-    """
-    results = []
-    for m in _INVERTED_BACKTICK_MATH.finditer(text):
-        ln = text.count("\n", 0, m.start()) + 1
-        results.append((ln, m.group()))
-    return results
+# That theory does not hold. Tested directly against GitHub's own markdown
+# rendering (POST https://api.github.com/markdown, mode=gfm) on the exact
+# worked example the check's own docstring used, `` `$\mathbb{Z}_4$` ``, and
+# separately on all 19 real instances this check was flagging in this
+# repository's own README and bibliography: every single one rendered as a
+# plain, correctly protected `<code>` element -- no `<math-renderer>` wrapper
+# appeared, and the underscore stayed literal text rather than becoming
+# emphasis. This matches CommonMark's specification: a code span has the
+# highest inline-parsing precedence, so once backticks are recognised as a
+# code span, nothing inside it -- not emphasis markers, not `$`, not
+# anything else -- is reinterpreted, regardless of how many other rendering
+# passes exist downstream.
+#
+# The check was traced to a commit (GitHubLinter 7e27d89) that introduced it
+# by extrapolation from the (separately, and correctly, verified) emphasis-
+# trap discovery, describing itself as "mirroring the wpmw linter update" --
+# but wpmw's history contains no equivalent check and no record of this
+# specific failure ever being observed on a live page. It appears to have
+# been a plausible-sounding inference that was never actually tested.
+#
+# Net effect while it was active: it produced ONLY false positives here (19
+# for 19), each one a legitimate use of a code span to *talk about* dollar-
+# math syntax in prose -- exactly the kind of documentation this repository
+# is full of. Removed rather than merely code-span-aware-ified, since there
+# is no known real failure for it to guard against.
+#
+# If a genuine instance of this failure is ever observed on a live GitHub
+# page, reinstate a check here -- but verify it the same way first.
 
 
 # --------------------------------------------------------------------------- #
@@ -843,21 +847,6 @@ def scan_paths(paths: Iterable[Path],
         # structural pass works on the raw text
         for line, msg, snippet in list_item_block_math(text):
             issues.append(Issue(md, line, "STRUCT", "display", snippet, msg))
-        # inverted-backtick pass also works on raw text
-        for line, expr in inverted_backtick_scan(text):
-            msg = (
-                f"Found `{expr}` -- backtick OUTSIDE the dollar signs. "
-                "This is the inverted form of the protected-math syntax. "
-                "GitHub's math pipeline may still attempt to render "
-                "the content as math, bypassing the code-span protection. "
-                "Use the correct form: `$`...`$` (backtick INSIDE the "
-                "dollars), which is GitHub's documented inline-math syntax "
-                "that bypasses CommonMark emphasis processing. "
-                "See https://github.blog/changelog/"
-                "2023-05-08-new-delimiter-syntax-for-inline-"
-                "mathematical-expressions/ ."
-            )
-            issues.append(Issue(md, line, "STATIC", "inline", expr, msg))
         for line, expr in adjacent_dollar_scan(strip_code(text)):
             lead, inner = expr[0], expr[2:-1]
             what = "a hyphen" if lead == "-" else "a quotation mark"
