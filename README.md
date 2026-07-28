@@ -16,7 +16,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 
 | Pass | Severity | Description |
 |------|----------|-------------|
-| **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. |
+| **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. Also covers two preprocessor-level failures where `$...$` never reaches MathJax at all: an opening `$` glued to a hyphen or a quotation mark (`-$x$`, `"$x$`), and math sitting inside a single-delimiter emphasis span (`*text $x$ text*`) — GitHub renders markdown to HTML *before* scanning for `$...$`, so math inside the resulting `<em>` is never picked up. Both leave the dollar signs on the rendered page verbatim. |
 | **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Also adds a **Static** check for the inverted-backtick form `` `$...$` `` (backtick outside the dollars). Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
 | **Structural** | Error | Multi-line `$$...$$` blocks inside list items. GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
@@ -281,11 +281,15 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   is not reliable. Use the correct form `$`...`$` instead.
   The linter's Static pass detects this.
 
-- **Inline math with `$` immediately preceded by a hyphen** (e.g.
-  `Fourier-in-$s$`, `-$N$`). GitHub's math parser excludes `$` as a
-  math delimiter when the preceding character is `-`, treating `-$`
-  as a negative-dollar sign rather than math. The `$...$` expression
-  simply fails to render.
+- **Inline math with `$` immediately preceded by a hyphen or a quotation
+  mark** (e.g. `Fourier-in-$s$`, `-$N$`, `"$x$ returns to zero,"`). GitHub's
+  math parser excludes `$` as a math delimiter when the preceding character
+  is a hyphen, a straight or curly double quote (`"` “ ”), or a straight or
+  curly single quote / apostrophe (`'` ‘ ’) — the hyphen case mirrors the
+  practice of treating `-$` as a negative-value dollar sign rather than
+  math; the quotation-mark case has no such rationale, it simply isn't
+  recognised. Either way the `$...$` expression fails to render and the
+  dollar signs are left on the page verbatim.
   Fix: use the backtick-dollar form `$`...`$` — it is recognised
   regardless of the preceding character:
 
@@ -293,6 +297,29 @@ fenced content, but **skips the GFM pass** — fenced math is exempt by design.
   | --- | --- |
   | `Fourier-in-$s$` | `Fourier-in-$`s`$` |
   | `-$N$` | `-$`N`$` |
+  | `"$x$ returns to zero,"` | `"$`x`$ returns to zero,"` |
+
+  The linter's Static pass detects this.
+
+- **Never put `$...$` inside a `*...*` or `_..._` emphasis span.** GitHub
+  renders the markdown to HTML *first* and only then scans for `$...$`
+  pairs to hand to MathJax. Math that has ended up inside the resulting
+  `<em>` is not picked up, and the dollar signs are left on the page
+  verbatim — in italics, which makes it look almost deliberate.
+
+  | Don't write | Write instead |
+  | --- | --- |
+  | `*carries the same $\mu$.*` | `*carries the same $`\mu`$.*` |
+  | `*linear in $N$*` | `*linear in $`N`$*` |
+
+  This bites hardest in **figure captions**, which are often italicised
+  by house style and often mention symbols; one caption naming a symbol
+  three times over produces six stray dollar signs.
+
+  Doubled delimiters (`**strong**`, `__strong__`) are *not* known to have
+  this problem — long-standing `**...$x$...**` run-in headers have been
+  observed to render correctly — so the linter does not flag them. If a
+  counterexample turns up, widen `_EMPH_SPAN` in the linter.
 
   The linter's Static pass detects this.
 - **Multi-line `$$...$$` outside lists**: fine and preferred for long

@@ -7,7 +7,16 @@ on GitHub:
 1. **Static** — patterns GitHub's MathJax config rejects even though vanilla
    MathJax/KaTeX would accept them (e.g. ``\\operatorname``, ``\\bm``,
    ``\\href``). These cause a visible "macro is not allowed" error in the
-   rendered page.
+   rendered page. Also covers two cases where GitHub's *preprocessor* never
+   recognises ``$...$`` as math at all, so nothing reaches MathJax and the
+   dollar signs are left on the page verbatim:
+
+   * an opening ``$`` glued to a hyphen or a quotation mark
+     (``-$x$``, ``"$x$``);
+   * math sitting inside a single-delimiter emphasis span
+     (``*text $x$ text*``), because GitHub renders the markdown to HTML
+     *before* scanning for ``$...$`` pairs, and math inside the resulting
+     ``<em>`` is never picked up.
 
 2. **GFM** — corruption introduced by GitHub's markdown sanitiser before
    the math is handed to MathJax. Two distinct failure modes are covered:
@@ -430,12 +439,18 @@ def inverted_backtick_scan(text: str) -> list[tuple[int, str]]:
 # negative-value dollar signs such as `-$5`.  The result is that the `$`
 # is treated as a literal character and the whole expression fails to render.
 #
+# The same failure occurs for other non-space characters glued to the
+# opening `$`.  Straight and curly quotation marks are the ones observed in
+# practice: `"$\mu$ returns to zero,"` leaves a literal `$\mu$` on the
+# rendered page.
+#
 # Example: `Fourier-in-$s$` -- the `$s$` never renders.
+# Example: `"$\mu$ returns to zero,"` -- likewise.
 # Fix: use the backtick-dollar form ``$`s`$``, which GitHub's parser
 # recognises as a distinct construct regardless of the preceding character.
 
-_HYPHEN_DOLLAR_MATH = re.compile(
-    r"-"
+_ADJACENT_DOLLAR_MATH = re.compile(
+    r"(?P<lead>[-\"\u201c\u201d\'\u2018\u2019])"
     r"\$(?!`)"          # $ not already the start of the backtick-dollar form
     r"(?![\s$])"        # standard opening condition: not followed by space / $
     r"[^\n$]{1,120}"
@@ -443,20 +458,129 @@ _HYPHEN_DOLLAR_MATH = re.compile(
     r"(?![0-9$`])"      # standard closing condition
 )
 
+# Backwards-compatible alias: the rule started life as a hyphen-only check.
+_HYPHEN_DOLLAR_MATH = _ADJACENT_DOLLAR_MATH
 
-def hyphen_dollar_scan(text: str) -> list[tuple[int, str]]:
+
+def adjacent_dollar_scan(text: str) -> list[tuple[int, str]]:
     """Scan raw markdown text for inline ``$...$`` math where the opening
-    ``$`` is immediately preceded by a hyphen, returning
+    ``$`` is glued to a hyphen or a quotation mark, returning
     ``(line_number, context)`` tuples.
 
     GitHub's parser does not recognise the opening ``$`` as a math
-    delimiter in this position.
+    delimiter in these positions.
     """
     results = []
-    for m in _HYPHEN_DOLLAR_MATH.finditer(text):
+    for m in _ADJACENT_DOLLAR_MATH.finditer(text):
         ln = text.count("\n", 0, m.start()) + 1
         results.append((ln, m.group()))
     return results
+
+
+# Backwards-compatible alias (the rule began as a hyphen-only check).
+hyphen_dollar_scan = adjacent_dollar_scan
+
+
+# --------------------------------------------------------------------------- #
+# 4f. Emphasis-span scan: math inside a single-delimiter emphasis span.       #
+# --------------------------------------------------------------------------- #
+# GitHub renders the markdown to HTML first and only then looks for `$...$`
+# pairs to hand to MathJax.  Math that ends up inside an `<em>` produced by
+# single-asterisk or single-underscore emphasis is not picked up, and the
+# dollar signs are left on the page verbatim.
+#
+# Example (observed on a rendered GitHub page, July 2026):
+#     *every pair sitting at the same place carries the same $\mu$.*
+# renders the literal text `$\mu$` in italics, instead of the symbol.
+#
+# Fix: use the backtick-dollar form ``$`\mu`$``, whose code span is opaque
+# to CommonMark inline processing, or move the math outside the emphasis.
+# This bites hardest in figure captions and other italicised prose that
+# happens to name a symbol.
+#
+# Note: doubled delimiters (`**strong**`, `__strong__`) are NOT flagged.
+# We have direct evidence only for the single-delimiter case, and have seen
+# long-standing `**...$x$...**` run-in headers that render correctly. If a
+# counterexample turns up, widen `_EMPH_SPAN`.
+
+_EMPH_SPAN = re.compile(
+    r"(?<![\w*_])(?P<d>[*_])(?![\s*_])"
+    r"(?P<body>(?:[^\n]|\n(?!\s*\n))+?)"
+    r"(?<![\s*_])(?P=d)(?![\w*_])"
+)
+
+_PLAIN_INLINE_MATH = re.compile(r"(?<!\$)\$(?!`)(?![\s$])(?P<expr>[^\n$]+?)(?<!\s)\$(?![0-9$`])")
+
+
+def _plain_math_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges covered by plain ``$...$`` inline math."""
+    return [(m.start(), m.end()) for m in _PLAIN_INLINE_MATH.finditer(text)]
+
+
+# Emphasis cannot run across a block boundary, so neither may a candidate
+# span: without this, the trailing `*lo*` of one table row would pair with
+# an asterisk in the next one and swallow any math in between.
+_BLOCK_BREAK = re.compile(
+    r"^\s*(?:\||#{1,6}\s|[-+*]\s|\d+[.)]\s|>\s?|$)"
+)
+
+
+def _prose_blocks(text: str) -> list[tuple[int, str]]:
+    """Split into inline-parsing units, as ``(char_offset, block_text)``."""
+    blocks: list[tuple[int, str]] = []
+    start = 0
+    cur: list[str] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        if _BLOCK_BREAK.match(line):
+            if cur:
+                blocks.append((start, "".join(cur)))
+                cur = []
+            blocks.append((pos, line))
+            start = pos + len(line)
+        else:
+            if not cur:
+                start = pos
+            cur.append(line)
+        pos += len(line)
+    if cur:
+        blocks.append((start, "".join(cur)))
+    return blocks
+
+
+def emphasis_span_math_scan(text: str) -> list[tuple[int, str, str]]:
+    """Find plain ``$...$`` math sitting inside a single-delimiter emphasis
+    span, returning ``(line_number, span_preview, math_preview)`` tuples.
+
+    Call with code-stripped text: inline code spans and fenced blocks must
+    not contribute asterisks or dollars.
+
+    Emphasis delimiters that are themselves inside a math expression -- the
+    asterisks of ``$(x^{*}, t^{*})$``, for instance -- are ignored, so the
+    pass does not fire on superscripted stars.
+    """
+    results: list[tuple[int, str, str]] = []
+    for offset, block in _prose_blocks(text):
+        math_spans = _plain_math_spans(block)
+        if not math_spans:
+            continue
+
+        def inside_math(pos: int, spans=math_spans) -> bool:
+            return any(a <= pos < b for a, b in spans)
+
+        for m in _EMPH_SPAN.finditer(block):
+            open_at, close_at = m.start(), m.end() - 1
+            if inside_math(open_at) or inside_math(close_at):
+                continue
+            contained = [(a, b) for a, b in math_spans
+                         if open_at < a and b <= close_at]
+            if not contained:
+                continue
+            ln = text.count("\n", 0, offset + m.start()) + 1
+            span_preview = " ".join(m.group(0).split())
+            math_preview = ", ".join(block[a:b] for a, b in contained[:3])
+            results.append((ln, span_preview, math_preview))
+    return sorted(results)
 
 
 
@@ -734,19 +858,30 @@ def scan_paths(paths: Iterable[Path],
                 "mathematical-expressions/ ."
             )
             issues.append(Issue(md, line, "STATIC", "inline", expr, msg))
-        for line, expr in hyphen_dollar_scan(text):
-            inner = expr[2:-1]
+        for line, expr in adjacent_dollar_scan(strip_code(text)):
+            lead, inner = expr[0], expr[2:-1]
+            what = "a hyphen" if lead == "-" else "a quotation mark"
             msg = (
-                f"Inline math `-{expr[1:]}` has `$` immediately preceded "
-                "by a hyphen. GitHub's math parser does not recognise the "
-                "opening `$` as a math delimiter in this position (the "
-                "`-$` sequence is excluded to avoid confusion with "
-                "negative-value dollar signs). "
+                f"Inline math `{expr}` has `$` immediately preceded "
+                f"by {what}. GitHub's math parser does not recognise the "
+                "opening `$` as a math delimiter in this position, so the "
+                "dollar signs are left on the rendered page verbatim. "
                 f"Fix: use the backtick-dollar form: "
-                f"`-$`{inner}`$` -- the backtick-dollar construct "
+                f"`{lead}$`{inner}`$` -- the backtick-dollar construct "
                 "is recognised regardless of the preceding character."
             )
             issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
+        for line, span, math in emphasis_span_math_scan(strip_code(text)):
+            msg = (
+                f"Inline math ({math}) sits inside a single-delimiter "
+                "emphasis span. GitHub renders the markdown to HTML before "
+                "looking for `$...$` pairs, and math inside the resulting "
+                "`<em>` is not picked up -- the dollar signs are left on the "
+                "rendered page verbatim. "
+                "Fix: use the backtick-dollar form `$`...`$` inside the "
+                "emphasis, or move the math outside it."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", span, msg))
 
         stripped = strip_code(text)
 
