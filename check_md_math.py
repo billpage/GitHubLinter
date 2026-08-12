@@ -25,7 +25,10 @@ on GitHub:
      rewritten as literal X inside math. ``\\,`` becomes a literal comma,
      ``\\!`` a literal bang, ``\\bigl\\{`` becomes ``\\bigl{`` — the last
      produces a hard "Missing or unrecognized delimiter for \\bigl" error;
-     the others corrupt spacing silently.
+     the others corrupt spacing silently. ``\\%`` is the sharpest case: it
+     becomes a literal ``%``, which opens a LaTeX comment running to end
+     of line and silently truncates the rest of the expression, including
+     the closing ``$`` — a hard "comment has no terminating newline" error.
    * The ``}_`` emphasis-trap: when `_` follows `}` inside an
      inline ``$...$`` region, CommonMark's emphasis rule fires
      (``}`` is punctuation so the ``_`` is unconditionally
@@ -304,6 +307,10 @@ _GFM_TARGETS = [
     ("\\:",  r"\\:",            r"\\:",  "medium space (no working letter-named form)"),
     ("\\{",  r"\lbrace",        r"\\{",  "literal left brace (CRITICAL with \\bigl etc.)"),
     ("\\}",  r"\rbrace",        r"\\}",  "literal right brace (CRITICAL with \\bigr etc.)"),
+    ("\\%",  r"\\%",            r"\\%",  "literal percent sign (CRITICAL: the stripped "
+                                         "`%` opens a LaTeX comment running to end of "
+                                         "line, silently eating the closing `$` and "
+                                         "everything meant to follow it)"),
 ]
 
 # Compile a regex per target with a negative lookbehind so we skip
