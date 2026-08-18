@@ -16,7 +16,12 @@ on GitHub:
    * math sitting inside a single-delimiter emphasis span
      (``*text $x$ text*``), because GitHub renders the markdown to HTML
      *before* scanning for ``$...$`` pairs, and math inside the resulting
-     ``<em>`` is never picked up.
+     ``<em>`` is never picked up;
+   * two ``$`...`$`` backtick-math spans glued directly together with no
+     separating whitespace (``$`0`$-$`2`$``): the leftover closing `$` of
+     the first span and the leftover opening `$` of the second get paired
+     as a spurious plain-math expression whose content is whatever sits
+     between them.
 
 2. **GFM** — corruption introduced by GitHub's markdown sanitiser before
    the math is handed to MathJax. Two distinct failure modes are covered:
@@ -97,13 +102,41 @@ _FENCED_BLOCK = re.compile(
     r"(?P<content>.*?)\n[ \t]*(?P=fence)[ \t]*$",
     re.MULTILINE | re.DOTALL,
 )
-_INLINE_CODE = re.compile(r"`[^`\n]+`")
+# Matches EITHER a `$`...`$` backtick-math span (preserved, not blanked --
+# see the note above extract_math() for why this matters) OR a plain `...`
+# code span (blanked, as before). The two are tried as alternatives at each
+# position rather than as a lookaround exclusion on a single pattern: an
+# exclusion approach (`(?<!\$)` / `(?!\$)` around the same greedy
+# `[^`\n]+`) shifts the match start to the *second* backtick of a
+# `$`...`$` span, whose greedy content-run then swallows every character up
+# to the next backtick anywhere in the line -- including an entire
+# unrelated second `$`...`$` span and all the prose between them. Matching
+# `$`...`$` as its own atomic, non-greedy alternative first avoids that: it
+# consumes exactly one span and lets the scan resume immediately after it,
+# so two spans separated only by ordinary prose (the common case) are each
+# still matched and preserved independently. It also means a documentation
+# example like `` `$...$` `` (a single code span whose content happens to
+# read like a math delimiter, used to describe this very syntax) is still
+# correctly matched by the second alternative and blanked as ordinary code,
+# since the first alternative requires an actual leading `$` before the
+# backtick and there isn't one at that position.
+_CODE_OR_BACKTICK_MATH = re.compile(
+    r"\$`(?P<mathcontent>[^`\n]+?)`\$"
+    r"|"
+    r"`(?P<codecontent>[^`\n]+)`"
+)
 _INDENTED_CODE_LINE = re.compile(r"^(?: {4}|\t).*$", re.MULTILINE)
 
 
 def _blank_keep_newlines(match: re.Match) -> str:
     s = match.group(0)
     return "".join("\n" if c == "\n" else " " for c in s)
+
+
+def _blank_code_only(match: re.Match) -> str:
+    if match.group("mathcontent") is not None:
+        return match.group(0)  # `$`...`$` -- leave untouched
+    return _blank_keep_newlines(match)  # plain `...` -- blank as code
 
 
 def strip_code(text: str) -> str:
@@ -114,9 +147,11 @@ def strip_code(text: str) -> str:
     that the linter can track which math expressions came from a fenced
     block (exempt from GitHub's CommonMark backslash-strip — verified
     empirically) versus from ``$...$`` / ``$$...$$`` (subject to it).
+    Genuine ``$`...`$`` backtick-math spans are left untouched here; see
+    the note above :func:`extract_math` for why.
     """
     text = _FENCED_BLOCK.sub(_blank_keep_newlines, text)
-    text = _INLINE_CODE.sub(_blank_keep_newlines, text)
+    text = _CODE_OR_BACKTICK_MATH.sub(_blank_code_only, text)
     text = _INDENTED_CODE_LINE.sub(_blank_keep_newlines, text)
     return text
 
@@ -124,6 +159,40 @@ def strip_code(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # 2. Extract math expressions from the (code-stripped) text.                  #
 # --------------------------------------------------------------------------- #
+#
+# Discovered bug (August 2026): §1's inline-code stripper used to blank
+# *every* single-backtick span, with no exception for one that is itself
+# the content-carrier of a ``$`...`$`` math expression. That ran before
+# this module ever looked for the backtick-dollar form, so ``$`K`$`` was
+# silently reduced to ``$   $`` before extraction. Two consequences, one
+# silent and repo-wide, one loud and specific to a glued pair of spans:
+#
+#   1. (Repo-wide, silent.) Every ``$`...`$`` expression -- the form these
+#      docs recommend precisely because it is immune to the other traps
+#      this module catches -- was excluded from the KaTeX/MathJax render
+#      pass. `extract_math()` never received the backticks needed to find
+#      it, so the render checks only ever validated the far rarer plain
+#      ``$...$`` form. Confirmed by probe: ``$`\alpha_`$`` (invalid --
+#      trailing `_` with no group) passed with 0 issues under the old
+#      code and is correctly flagged once the fix below is in place.
+#
+#   2. (Loud, when it occurs.) Two ``$`...`$`` spans glued directly
+#      together with no separating whitespace -- e.g. ``$`0`$-$`2`$`` --
+#      left the residue ``$   $-$   $`` after blanking. The *plain*-math
+#      regex below then ran on that residue and found a spurious pair:
+#      the leftover closing `$` of the first span and the opening `$` of
+#      the second, with the character between them read as the entire
+#      expression. If that character is not valid bare LaTeX (an en dash,
+#      say), KaTeX rejects it outright; if it happens to be alphanumeric
+#      or ordinary punctuation, it silently renders as garbled inline
+#      math instead. See §4g below for the corresponding static check --
+#      the corrected extractor here cleanly separates the two spans, so
+#      there is no longer a bogus expression for the render pass to catch,
+#      and only a structural scan can catch this class of bug.
+#
+# Fix: §1's stripper now matches ``$`...`$`` as its own atomic, non-greedy
+# alternative and leaves it untouched, so this function is the only place
+# that ever consumes the backtick-dollar form.
 
 _BLOCK_MATH = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _INLINE_MATH = re.compile(
@@ -594,6 +663,59 @@ def emphasis_span_math_scan(text: str) -> list[tuple[int, str, str]]:
     return sorted(results)
 
 
+# --------------------------------------------------------------------------- #
+# 4g. Glued backtick-math scan: `$`...`$X$`...`$` with no separating space.   #
+# --------------------------------------------------------------------------- #
+# Two ``$`...`$`` spans placed directly against each other, with no
+# whitespace between the closing `$` of one and the opening `$` of the
+# next, leave a stray, unintended plain-math expression behind. The
+# backtick-blanking pass (§1) reduces each span's *content* to blanks but
+# leaves the four dollar signs in place; the plain ``$...$`` scanner then
+# pairs the leftover closing `$` of the first span with the leftover
+# opening `$` of the second, reading whatever sits between them -- the
+# connecting text itself -- as its entire expression.
+#
+# Confirmed empirically (August 2026) against a live rendered page:
+# ``Moments $`0`$-$`2`$ of the`` (with an en dash as the connector) --
+# the dash between the two spans was parsed as its own bare math
+# expression and rejected by KaTeX as an unrecognised Unicode character.
+# The many ``$`X`$-word`` hyphenated-compound cases elsewhere are NOT this
+# trap -- those have whitespace nowhere near the delimiters and render
+# correctly. This is specifically the *zero-whitespace, span-touching-span*
+# case, and it applies regardless of what the connecting text actually is:
+# a connector that happens to be alphanumeric or ordinary punctuation
+# won't produce a hard KaTeX error the way an unrecognised symbol does,
+# but it still renders as a stray, garbled inline-math fragment instead of
+# plain text.
+#
+# Fix: add a space on at least one side of the connector (only one is
+# needed to break the adjacency), or fold both spans into one, e.g.
+# ``$`0`$ - $`2`$`` or ``$`0\text{--}2`$``.
+
+_GLUED_BACKTICK_MATH = re.compile(
+    r"`\$"          # closing half of one $`...`$ span
+    r"(?=\S)"       # connecting text does not open on whitespace
+    r"[^\n$]+?"     # the connecting text itself (no $, no newline)
+    r"(?<=\S)"      # connecting text does not close on whitespace
+    r"\$`"          # opening half of the next $`...`$ span
+)
+
+
+def glued_backtick_math_scan(text: str) -> list[tuple[int, str]]:
+    """Scan code-stripped markdown text for two ``$`...`$`` spans placed
+    directly against each other with no separating whitespace, returning
+    ``(line_number, context)`` tuples.
+
+    GitHub's math parser reads the connecting text between the two spans
+    as a stray plain-math expression of its own.
+    """
+    results = []
+    for m in _GLUED_BACKTICK_MATH.finditer(text):
+        ln = text.count("\n", 0, m.start()) + 1
+        results.append((ln, m.group()))
+    return results
+
+
 
 
 _LIST_ITEM_OPEN = re.compile(r"^(\s*)(?:[-+*]\s+|\d+[.)]\s+)")
@@ -878,6 +1000,19 @@ def scan_paths(paths: Iterable[Path],
                 "emphasis, or move the math outside it."
             )
             issues.append(Issue(md, line, "STATIC", "inline", span, msg))
+        for line, expr in glued_backtick_math_scan(strip_code(text)):
+            gap = expr[2:-2]  # drop the shared `$ ... $` delimiter halves
+            msg = (
+                f"Two backtick-math spans are glued together with no "
+                f"separating space (`{expr}`). GitHub's math parser pairs "
+                f"the leftover closing `$` of the first span with the "
+                f"leftover opening `$` of the second and reads the "
+                f"connecting text `{gap}` as a stray expression of its "
+                "own, independent of both real spans. "
+                "Fix: add a space on at least one side of the connector, "
+                "or fold both spans into one."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
 
         stripped = strip_code(text)
 
