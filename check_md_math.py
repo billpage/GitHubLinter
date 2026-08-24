@@ -785,6 +785,83 @@ def glued_backtick_math_scan(text: str) -> list[tuple[int, str]]:
     return results
 
 
+# --------------------------------------------------------------------------- #
+# Unclosed backtick-math scan: `$`...` ` with the closing `$` dropped.       #
+# --------------------------------------------------------------------------- #
+# The backtick-dollar form is written $`...`$ -- two delimiters, a `$`
+# *and* a `` ` `` on each side. Dropping the closing `$` (typically because
+# a run-in bold marker or sentence-final period was typed right after the
+# closing backtick, e.g. `$`(x, p)`.**`) leaves `$`(x, p)`` -- to
+# CommonMark this is nothing but a literal `$` followed by an ordinary
+# `` `(x, p)` `` code span. Two consequences, both silent:
+#
+#   1. GitHub's math-recognition step, which looks for the literal
+#      ``$`...`$`` pattern before CommonMark ever runs, does not find it
+#      here (the trailing `$` is missing), so the span is never protected
+#      from CommonMark's own code-span parsing.
+#   2. CommonMark then treats the backticks as a plain code span in the
+#      normal way, and code spans are opaque -- their content is not
+#      further processed. The orphaned `$` immediately in front survives
+#      as literal, visible text, exactly as if it had been typed as prose.
+#
+# `extract_math()` does not report anything for this case either: at the
+# `$` position the backtick-dollar regex requires the whole
+# ``$`...`$`` pattern to match starting there and fails; the plain
+# ``$...$`` regex then finds no partner `$` on the same line for the lone
+# leftover sign. The malformed span is therefore invisible to every check
+# that operates on extracted math expressions -- this scan has to run on
+# raw text instead, the same way ``list_item_block_math`` does.
+#
+# Confirmed empirically (August 2026, billpage/wpmw) against a live
+# rendered page: ``**Not in $`(x, p)`.** Acting on $`W(x, p)`$, neither
+# piece...`` -- the first, malformed span left the literal fragment
+# ``Not in (x, p) . Actingon`` on the page (GitHub's own math-detection
+# pass greedily paired the orphaned `$` with the *next* line's closing
+# `` `$ `` and rendered everything between -- including the intervening
+# prose -- as one garbled math expression, which is also why the words
+# lost their spaces: LaTeX math mode treats bare whitespace as
+# insignificant).
+#
+# Fix: add the missing trailing `$`.
+#
+# The scan has to stay code-span-aware to avoid flagging documentation
+# that *talks about* this exact syntax inside its own code spans (e.g. a
+# style-guide line showing `` `$...$` `` as an example) -- a naive
+# ``\$`[^`]+`(?!\$)`` regex over raw text fires on those too, since a
+# `$` sitting at the end of one code span's displayed text can be
+# immediately followed by the backtick that opens the *next* code span.
+# Multi-backtick spans (`` `` `x` `` ``, used to show literal backticks)
+# are matched and skipped as a single atomic unit first, for the same
+# reason.
+
+_UNCLOSED_BACKTICK_MATH = re.compile(
+    r"(?P<fence>`{2,})(?:(?!(?P=fence)).)*?(?P=fence)"  # multi-backtick code span -- skip
+    r"|"
+    r"\$`[^`\n]+?`\$"                        # well-formed $`...`$ -- skip
+    r"|"
+    r"\$`(?P<bad>[^`\n]+?)`(?!\$)"           # malformed: closing $ missing
+    r"|"
+    r"`[^`\n]+`"                             # any other single-backtick code span -- skip
+)
+
+
+def unclosed_backtick_math_scan(text: str) -> list[tuple[int, str]]:
+    """Scan *raw* markdown text (not code-stripped -- this check needs to
+    see the code spans strip_code() would blank) for a ``$`...``` span
+    missing its closing ``$``, returning ``(line_number, context)`` tuples.
+
+    Call on the raw file text, matching :func:`list_item_block_math`: this
+    malformed pattern degrades into an ordinary code span under CommonMark,
+    so :func:`extract_math` never captures it as a math expression to
+    check in the first place.
+    """
+    results = []
+    for m in _UNCLOSED_BACKTICK_MATH.finditer(text):
+        if m.group("bad") is None:
+            continue
+        ln = text.count("\n", 0, m.start()) + 1
+        results.append((ln, m.group()))
+    return results
 
 
 _LIST_ITEM_OPEN = re.compile(r"^(\s*)(?:[-+*]\s+|\d+[.)]\s+)")
@@ -1045,6 +1122,20 @@ def scan_paths(paths: Iterable[Path],
         # structural pass works on the raw text
         for line, msg, snippet in list_item_block_math(text):
             issues.append(Issue(md, line, "STRUCT", "display", snippet, msg))
+        for line, expr in unclosed_backtick_math_scan(text):
+            msg = (
+                f"Backtick-math span `{expr}` is missing its closing `$`. "
+                "GitHub's math-detection step looks for the literal "
+                "`$`...`$` pattern before CommonMark runs; without the "
+                "trailing `$` it doesn't match, so CommonMark parses the "
+                "backticks as an ordinary code span instead, and the "
+                "orphaned `$` in front is left as literal text -- or, "
+                "worse, gets paired by GitHub's own scanner with the next "
+                "properly-closed span's closing `` `$ `` on the line, "
+                "turning everything in between into one garbled "
+                "expression. Fix: add the missing trailing `$`."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
         for line, expr in adjacent_dollar_scan(strip_code(text)):
             lead, inner = expr[0], expr[2:-1]
             what = "a hyphen" if lead == "-" else "a quotation mark"
