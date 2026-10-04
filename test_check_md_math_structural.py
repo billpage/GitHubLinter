@@ -28,7 +28,29 @@ CASES = {
  "wrapped, safe":               ("> gives\n> $`a = b\n> \; c`$, which\n", [], []),
  "closed span then bullet":     ("> $`a`$ then $`b`$.\n> - item\n", [], []),
 }
+
+# --- static rules ported from wpmw (table pipes, \boldsymbol) ---
+import re
+from check_md_math import table_pipe_math_scan as T, _STATIC_PATTERNS
+
+def static_hit(text):
+    return any(rx.search(text) for rx, _ in _STATIC_PATTERNS)
+
+STATIC_CASES = {
+ "table pipe, backtick math":   (lambda: [n for n, _ in T("| a | $`\\sum_q |K_q|`$ |\n")] == [1]),
+ "table pipe, plain dollars":   (lambda: [n for n, _ in T("| a | $|x|$ |\n")] == [1]),
+ "table pipe, escaped":         (lambda: T("| a | $`\\sum_q \\|K_q\\|`$ |\n") == []),
+ "pipe outside a table":        (lambda: T("rate $`|x|`$ here\n") == []),
+ "pipe in fenced block":        (lambda: T("```\n| a | $`|x|`$ |\n```\n") == []),
+ "double-backtick example":     (lambda: T("| `` $`|x|`$ `` |\n") == []),
+ "boldsymbol flagged":          (lambda: static_hit("$\\boldsymbol{x}$")),
+ "bm flagged":                  (lambda: static_hit("$\\bm{x}$")),
+ "pmb and mathbf fine":         (lambda: not static_hit("$\\pmb{\\xi}$ $\\mathbf{x}$")),
+}
 bad = 0
+for name, ok in STATIC_CASES.items():
+    bad += not ok()
+    print(("ok   " if ok() else "FAIL ") + name)
 for name, (text, want_f, want_s) in CASES.items():
     got_f, got_s = fence(text), span(text)
     ok = got_f == want_f and got_s == want_s

@@ -16,7 +16,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 
 | Pass | Severity | Description |
 |------|----------|-------------|
-| **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. Also covers two preprocessor-level failures where `$...$` never reaches MathJax at all: an opening `$` glued to a hyphen or a quotation mark (`-$x$`, `"$x$`), and math sitting inside a single-delimiter emphasis span (`*text $x$ text*`) — GitHub renders markdown to HTML *before* scanning for `$...$`, so math inside the resulting `<em>` is never picked up. Both leave the dollar signs on the rendered page verbatim. |
+| **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\boldsymbol`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. Also covers two preprocessor-level failures where `$...$` never reaches MathJax at all: an opening `$` glued to a hyphen or a quotation mark (`-$x$`, `"$x$`), and math sitting inside a single-delimiter emphasis span (`*text $x$ text*`) — GitHub renders markdown to HTML *before* scanning for `$...$`, so math inside the resulting `<em>` is never picked up. Both leave the dollar signs on the rendered page verbatim. Also an unescaped `|` inside math on a table row (see *Additional tips*). |
 | **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
 | **Structural** | Error | (1) Multi-line `$$...$$` blocks inside list items: GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. (2) A ` ```math ` fence inside a **list that already has inline math**: GitHub shows it as raw code. (3) A `` $`...`$ `` span wrapped onto a line that starts with a block marker (`-`, `+`, `*`, `1.`, `#`): markdown ends the paragraph there and the whole span shows as code. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
@@ -170,7 +170,7 @@ disables several extensions. These macros are not supported:
 | `\tag` | Equation numbering is not supported |
 | `\intertext` | Not supported |
 | `\mathds` | Use `\mathbb` instead |
-| `\bm` | Use `\boldsymbol{...}` or `\mathbf{...}` |
+| `\bm`, `\boldsymbol` | Use `\mathbf{x}` for Latin letters and `\pmb{\xi}` for Greek (`\mathbf{\xi}` renders but is not bold) |
 | `\colorbox`, `\fcolorbox`, `\definecolor` | Not supported |
 
 The linter's **static pass** catches all of these.
@@ -239,7 +239,7 @@ cases into a GitHub comment's *Preview* tab isolated the cause:
 
 Neither nesting nor a missing blank line is the cause by itself. The case
 "inline math appears only *after* the fence" was not tested, so it is not
-flagged. `python test_check_md_math_structural.py` runs the cases.
+flagged. `python test_check_md_math_structural.py` runs the cases, and the table-pipe and `\boldsymbol` rules.
 
 ### Additional tips
 
@@ -248,8 +248,9 @@ flagged. `python test_check_md_math_structural.py` runs the cases.
   supported.
 - **Prose in math**: use `\text{...}` for subscripts like
   `_{\text{short-range}}`, unit labels, etc.
-- **Bold math**: use `\boldsymbol{x}` or `\mathbf{x}`, not `\bm{x}` (the
-  `bm` package is not loaded on GitHub).
+- **Bold math**: `\mathbf{x}` for Latin letters and `\pmb{\xi}` for Greek.
+  Neither `\bm` nor `\boldsymbol` is loaded on GitHub (base and ams only),
+  and `\mathbf{\xi}` renders but is not bold.
 - **Inline math adjacent to digits**: `$x$5` can confuse GitHub's parser.
   A space — `$x$ 5` — avoids the problem entirely.
 - **Inline math with `}_` or `'_` (subscript right after a brace or prime): wrap in
@@ -326,6 +327,25 @@ flagged. `python test_check_md_math_structural.py` runs the cases.
 
   The linter's Static pass detects this.
 
+- **In a table row, escape every `|` inside math as `\|`.** GitHub splits
+  a table row into cells at each unescaped pipe *before* it recognises code
+  spans or math, so an absolute value or norm on a table row cuts the math
+  span in two: the cell ends at the first `|` and the rest is lost. In a
+  header row the stray pipes change the column count, and the whole block
+  renders as plain text instead of a table.
+
+  ```text
+  Don't write:   | rate | $`\sum_q |K_q|`$ |
+  Write instead: | rate | $`\sum_q \|K_q\|`$ |
+  ```
+
+  (Shown in a code block because a table cannot display an unescaped pipe
+  even inside a code span, which is the same rule again.) GFM removes the
+  backslash while splitting the row, so the math renderer receives an
+  ordinary `|` and the absolute value is drawn correctly. The same `\|`
+  *outside* a table is LaTeX's double bar, so this is a table-only rule.
+  The linter's table-pipe pass enforces this.
+
 - **Never put `$...$` inside a `*...*` or `_..._` emphasis span.** GitHub
   renders the markdown to HTML *first* and only then scans for `$...$`
   pairs to hand to MathJax. Math that has ended up inside the resulting
@@ -365,7 +385,7 @@ No third-party Python packages are required.
 
 ```
 check_md_math.py              # The linter — single self-contained file
-test_check_md_math_structural.py  # Regression cases for the structural rules
+test_check_md_math_structural.py  # Regression cases for the structural and table-pipe/boldsymbol rules
 .github/
   workflows/
     check_md_math.yml         # GitHub Actions CI workflow

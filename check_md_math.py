@@ -345,7 +345,11 @@ _STATIC_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\\mathds\b"),
      r"\mathds — dsfont package not available; use \mathbb."),
     (re.compile(r"\\bm\b"),
-     r"\bm — bm package not loaded; use \boldsymbol or \mathbf."),
+     r"\bm — bm package not loaded; use \pmb for bold Greek, \mathbf for Latin."),
+    (re.compile(r"\\boldsymbol\b"),
+     r"\boldsymbol — boldsymbol package not loaded (GitHub loads base and ams "
+     r"only); use \pmb for bold Greek, \mathbf for Latin. \mathbf{\xi} renders "
+     r"but is not bold."),
     (re.compile(r"\\colorbox\b|\\fcolorbox\b"),
      r"\colorbox / \fcolorbox — not supported."),
     (re.compile(r"\\definecolor\b"),
@@ -1106,6 +1110,67 @@ def math_span_split_by_block_marker(text: str) -> list[tuple[int, str, str]]:
 
 
 # --------------------------------------------------------------------------- #
+# 4i. Table-pipe scan: an unescaped `|` inside math on a table row.          #
+# --------------------------------------------------------------------------- #
+# GitHub splits a table row into cells at every unescaped `|` *before* any
+# inline parsing -- before code spans, and so before math, is recognised.
+# The GFM spec is explicit that this applies inside inline spans too. An
+# absolute value or norm written `$`|x|`$` on a table row therefore cuts
+# the math span in two: the cell ends at the first `|`, the page shows the
+# literal fragment `$`\Gamma = \sum_q` and nothing after it, and if the
+# stray pipes land in the header row the column count changes and the whole
+# block stops being a table at all.
+#
+# Confirmed empirically (September 2026) on the rendered ORIENTATION.md:
+# ``| **(D)** | ... at rate $`\Gamma = \sum_q |K_{\mathrm{res}}(q)|`$ ... |``
+# rendered as ``rate $`\Gamma = \sum_q`` with the rest of the cell gone;
+# reproduced exactly by cmark-gfm, which also showed two tables in
+# docs/analysis/species_sectors_and_annihilation.md whose header rows held
+# such pipes rendering as plain text rather than as tables.
+#
+# Fix: escape the pipe as `\|`. GFM removes that backslash when it splits
+# the row, so the math renderer receives an ordinary `|` -- the absolute
+# value is drawn correctly. (This is why `\|` inside a table row does *not*
+# produce the LaTeX double bar; outside a table it would.)
+#
+# Scope: raw text, rows whose first non-blank character is `|`, outside
+# fenced blocks; both ``$`...`$`` and plain ``$...$`` spans. Double-
+# backtick code spans are skipped first, so a style guide may show the
+# broken form as an example; single-backtick code spans are blanked before
+# the plain-dollar pass so their contents are not mistaken for math.
+
+_TABLE_FENCE = re.compile(r"^\s*(```|~~~)")
+_DOUBLE_TICK_SPAN = re.compile(r"(`{2,}).*?\1")
+_BACKTICK_MATH_SPAN = re.compile(r"\$`(?P<expr>[^`\n]*?)`\$")
+_SINGLE_TICK_SPAN = re.compile(r"`[^`\n]*`")
+_PLAIN_MATH_SPAN = re.compile(r"(?<![\\$])\$(?P<expr>[^$\n]+?)\$")
+_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
+def table_pipe_math_scan(text: str) -> list[tuple[int, str]]:
+    """Scan *raw* markdown text for math spans on table rows that contain an
+    unescaped ``|``, returning ``(line_number, span)`` tuples."""
+    results = []
+    fence = False
+    for ln, line in enumerate(text.split("\n"), 1):
+        if _TABLE_FENCE.match(line):
+            fence = not fence
+            continue
+        if fence or not line.lstrip().startswith("|"):
+            continue
+        row = _DOUBLE_TICK_SPAN.sub(lambda m: " " * len(m.group()), line)
+        for m in _BACKTICK_MATH_SPAN.finditer(row):
+            if _UNESCAPED_PIPE.search(m.group("expr")):
+                results.append((ln, m.group()))
+        row = _BACKTICK_MATH_SPAN.sub(lambda m: " " * len(m.group()), row)
+        row = _SINGLE_TICK_SPAN.sub(lambda m: " " * len(m.group()), row)
+        for m in _PLAIN_MATH_SPAN.finditer(row):
+            if _UNESCAPED_PIPE.search(m.group("expr")):
+                results.append((ln, m.group()))
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # 6. Optional render checks via node + katex / mathjax-full.                  #
 # --------------------------------------------------------------------------- #
 
@@ -1315,6 +1380,19 @@ def scan_paths(paths: Iterable[Path],
                 "properly-closed span's closing `` `$ `` on the line, "
                 "turning everything in between into one garbled "
                 "expression. Fix: add the missing trailing `$`."
+            )
+            issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
+        for line, expr in table_pipe_math_scan(text):
+            fixed = re.sub(r"(?<!\\)\|", r"\\|", expr)
+            msg = (
+                f"Math `{expr}` on a table row contains an unescaped `|`. "
+                "GitHub splits table cells at every unescaped pipe before "
+                "it recognises math, so the span is cut at the first `|` "
+                "and the rest of the cell is lost; in a header row the "
+                "column count changes and the block stops being a table. "
+                f"Fix: escape it as `\\|` -- `{fixed}`. GFM removes the "
+                "backslash when splitting the row, so the math still "
+                "receives a plain `|`."
             )
             issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
         for line, expr in adjacent_dollar_scan(strip_code(text)):
