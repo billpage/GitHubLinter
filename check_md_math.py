@@ -101,6 +101,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -720,7 +721,9 @@ def emphasis_span_math_scan(text: str) -> list[tuple[int, str, str]]:
 
     Emphasis delimiters that are themselves inside a math expression -- the
     asterisks of ``$(x^{*}, t^{*})$``, for instance -- are ignored, so the
-    pass does not fire on superscripted stars.
+    pass does not fire on superscripted stars. The same holds inside a
+    protected ``$`...`$`` span (a converted ``^*`` must not look like
+    emphasis to this pass).
     """
     results: list[tuple[int, str, str]] = []
     for offset, block in _prose_blocks(text):
@@ -728,7 +731,11 @@ def emphasis_span_math_scan(text: str) -> list[tuple[int, str, str]]:
         if not math_spans:
             continue
 
-        def inside_math(pos: int, spans=math_spans) -> bool:
+        # asterisks inside a protected `$`...`$` span are not emphasis either
+        protected = [(m.start(), m.end())
+                     for m in re.finditer(r"\$`.*?`\$", block, flags=re.S)]
+
+        def inside_math(pos: int, spans=math_spans + protected) -> bool:
             return any(a <= pos < b for a, b in spans)
 
         for m in _EMPH_SPAN.finditer(block):
@@ -797,6 +804,196 @@ def glued_backtick_math_scan(text: str) -> list[tuple[int, str]]:
         ln = text.count("\n", 0, m.start()) + 1
         results.append((ln, m.group()))
     return results
+
+
+# --------------------------------------------------------------------------- #
+# 4j. Paragraph scan: `*` inside plain $...$ math, and `$...$` wrapped over   #
+#     lines.                                                                  #
+# --------------------------------------------------------------------------- #
+# GitHub renders the markdown to HTML *before* it looks for ``$...$``, so any
+# emphasis the CommonMark parser finds inside a plain dollar span puts
+# ``<em>`` tags into the text and the span no longer matches.
+#
+# (a) ``*``. ``^*`` (complex conjugate) and ``^{*}`` are the usual cases. A
+#     ``*`` after punctuation and before punctuation can both open and close
+#     emphasis, so with another ``*`` anywhere in the paragraph -- often the
+#     second ``^*`` in the same span -- the pair becomes ``<em>`` and eats the
+#     math between them. 2026-10-04: ``$\delta = \Lambda_j^s(x^*, t^*)$`` in
+#     ``phase_resonance_microdynamics.md`` showed as raw text; cmark-gfm found
+#     four more spans of the same shape in three other notes.
+# (b) A plain ``$...$`` span wrapped over two source lines is not seen by the
+#     per-expression passes (they match one line at a time), so the ``}_{``
+#     emphasis trap (4b) went unreported there
+#     (``relational_pairing_and_carrier_lock.md``).
+#
+# Fix for both: backtick-dollar form ``$`...`$``, which GitHub protects.
+# Verified against cmark-gfm: the rule reports exactly the six spans cmark
+# cuts, and nothing else, on every note in the repository.
+
+_PARA_PLAIN_MATH = re.compile(
+    r"(?<![\\$])\$(?![ \t\n$`])"           # opening $
+    r"(?P<expr>(?:[^$\n]|\n(?![ \t]*\n))+?)"  # may wrap, never over a blank line
+    r"(?<![ \t\n])\$(?![0-9$])"            # closing $
+)
+
+
+def _paragraphs(text: str):
+    """Yield ``(first_line_no, [lines])`` for each paragraph, outside fences,
+    with blockquote markers removed."""
+    para: list[str] = []
+    start = 0
+    fence: tuple[str, int] | None = None
+    for no, raw in enumerate(text.split("\n"), 1):
+        line = re.sub(r"^(?:[ \t]*>)+ ?", "", raw)
+        st = line.strip()
+        fm = re.match(r"^(`{3,}|~{3,})", st)
+        if fence is not None:
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= fence[1] \
+                    and st == fm.group(1):
+                fence = None
+            continue
+        if fm:
+            if para:
+                yield start, para
+            para, fence = [], (fm.group(1)[0], len(fm.group(1)))
+            continue
+        if not st:
+            if para:
+                yield start, para
+            para = []
+            continue
+        lm = re.match(r"^([ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+)(?=\S)", line)
+        if lm:                       # a list item starts its own block
+            if para:
+                yield start, para
+            para, start = [], no
+            line = line[lm.end():]
+        if not para:
+            start = no
+        para.append(line)
+    if para:
+        yield start, para
+
+
+def _mask_protected(body: str) -> str:
+    """Blank (with spaces, keeping newlines) everything GitHub protects from
+    emphasis parsing: code spans, ``$`...`$`` spans and ``$$...$$`` blocks.
+    Scans left to right so a backtick inside a math span is not mistaken for
+    a code span and vice versa."""
+    out = list(body)
+    i, n = 0, len(body)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        if body.startswith("$`", i):
+            k = body.find("`$", i + 2)
+            if k < 0:
+                i += 2
+                continue
+            blank(i, k + 2)
+            i = k + 2
+        elif body.startswith("$$", i):
+            k = body.find("$$", i + 2)
+            if k < 0:
+                i += 2
+                continue
+            blank(i, k + 2)
+            i = k + 2
+        elif body[i] == "`":
+            j = i
+            while j < n and body[j] == "`":
+                j += 1
+            run = body[i:j]
+            k = body.find(run, j)
+            while k >= 0 and k + len(run) < n and body[k + len(run)] == "`":
+                k = body.find(run, k + 1)
+            if k < 0:
+                i = j
+            else:
+                blank(i, k + len(run))
+                i = k + len(run)
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _is_punct(c: str) -> bool:
+    return unicodedata.category(c)[0] in "PS"
+
+
+def _matched_asterisks(body: str) -> set[int]:
+    """Positions of ``*`` characters that CommonMark turns into emphasis tags
+    (CommonMark 0.30 §6.2, delimiter-run algorithm, ``*`` only)."""
+    runs = []    # [start, length, orig_length, can_open, can_close]
+    i, n = 0, len(body)
+    while i < n:
+        if body[i] == "*" and (i == 0 or body[i - 1] != "\\"):
+            j = i
+            while j < n and body[j] == "*":
+                j += 1
+            before = body[i - 1] if i > 0 else " "
+            after = body[j] if j < n else " "
+            ws_b, ws_a = before.isspace(), after.isspace()
+            pu_b, pu_a = _is_punct(before), _is_punct(after)
+            left = (not ws_a) and (not pu_a or ws_b or pu_b)
+            right = (not ws_b) and (not pu_b or ws_a or pu_a)
+            runs.append([i, j - i, j - i, left, right])
+            i = j
+        else:
+            i += 1
+    matched: set[int] = set()
+    bottom: dict[int, int] = {}     # cmark's openers_bottom, keyed by the closer's original length % 3
+    for ci, closer in enumerate(runs):
+        if not closer[4]:
+            continue
+        while closer[1] > 0:
+            key = closer[2] % 3
+            oi = None
+            for k in range(ci - 1, bottom.get(key, -1), -1):
+                op = runs[k]
+                if op[1] == 0 or not op[3]:
+                    continue
+                if (op[4] or closer[3]) and (op[2] + closer[2]) % 3 == 0 \
+                        and not (op[2] % 3 == 0 and closer[2] % 3 == 0):
+                    continue
+                oi = k
+                break
+            if oi is None:
+                bottom[key] = ci - 1
+                break
+            op = runs[oi]
+            use = 2 if op[1] >= 2 and closer[1] >= 2 else 1
+            for t in range(use):
+                matched.add(op[0] + op[1] - 1 - t)
+                matched.add(closer[0] + t)
+            op[1] -= use
+            closer[0] += use
+            closer[1] -= use
+            for k in range(oi + 1, ci):        # delimiters between are dropped
+                runs[k][1] = 0
+    return matched
+
+
+def paragraph_math_emphasis_scan(text: str) -> list[tuple[int, str, str]]:
+    """Return ``(line, kind, span)`` for plain ``$...$`` spans that markdown
+    will cut: ``kind`` is ``"asterisk"`` (an emphasis tag opens or closes
+    inside the span) or ``"wrapped-underscore"``."""
+    out: list[tuple[int, str, str]] = []
+    for first, lines in _paragraphs(text):
+        body = _mask_protected("\n".join(lines))
+        hit = _matched_asterisks(body)
+        for m in _PARA_PLAIN_MATH.finditer(body):
+            line = first + body.count("\n", 0, m.start())
+            if any(m.start() <= k < m.end() for k in hit):
+                out.append((line, "asterisk", m.group()))
+            elif "\n" in m.group("expr") and \
+                    re.search(r"(?<=[^\w\s])_\S", m.group("expr")):
+                out.append((line, "wrapped-underscore", m.group()))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1395,6 +1592,24 @@ def scan_paths(paths: Iterable[Path],
                 "receives a plain `|`."
             )
             issues.append(Issue(md, line, "STATIC", "inline", expr.strip(), msg))
+        for line, kind, span in paragraph_math_emphasis_scan(text):
+            if kind == "asterisk":
+                msg = (
+                    f"Inline math `{span}` contains a `*` that CommonMark "
+                    "pairs with another `*` in the paragraph as emphasis "
+                    "(`^*` can both open and close). The tags land inside "
+                    "the `$...$` span and GitHub shows the raw source. "
+                    "Fix: backtick-dollar form `$`...`$`, which GitHub "
+                    "protects."
+                )
+            else:
+                msg = (
+                    f"Inline math `{span}` wraps over a line and contains "
+                    "`_` after punctuation (`}_{`, `)_q`, `'_i`): CommonMark "
+                    "treats it as an italic opener and the span fails to "
+                    "render. Fix: backtick-dollar form `$`...`$`."
+                )
+            issues.append(Issue(md, line, "STATIC", "inline", span.strip(), msg))
         for line, expr in adjacent_dollar_scan(strip_code(text)):
             lead, inner = expr[0], expr[2:-1]
             what = "a hyphen" if lead == "-" else "a quotation mark"

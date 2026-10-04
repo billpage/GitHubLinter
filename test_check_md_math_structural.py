@@ -57,4 +57,32 @@ for name, (text, want_f, want_s) in CASES.items():
     bad += not ok
     print(("ok   " if ok else "FAIL ") + name, "" if ok else f"fence={got_f} span={got_s}")
 print("failures:", bad)
-raise SystemExit(1 if bad else 0)
+
+# --- paragraph pass: `*` in plain $...$ and wrapped $...$ (2026-10-04) ---
+from check_md_math import paragraph_math_emphasis_scan as P
+
+def kinds(t): return [(n, k) for n, k, _ in P(t)]
+
+PARA_CASES = {
+ "two ^* in one span":            (lambda: kinds("event $(x^*, t^*)$ here\n") == [(1, "asterisk")]),
+ "two ^{*} in one span":          (lambda: kinds("at $(x^{*}, t^{*})$ is\n") == [(1, "asterisk")]),
+ "one ^* in each of two lines":   (lambda: len(kinds("**Self.** H, $a = b^{*}$, ap\n$c = d^{*}$ x\n")) == 2),
+ "lone ^* beside balanced bold":  (lambda: kinds("the **$M$** grid, $\\rho = \\psi\\psi^*$ with\n") == []),
+ "lone ^* alone":                 (lambda: kinds("so $x^*$ here\n") == []),
+ "backtick-dollar is protected":  (lambda: kinds("event $`(x^*, t^*)`$ here\n") == []),
+ "code span with asterisks":      (lambda: kinds("use `*a*` and $x^*$ here\n") == []),
+ "list items are separate":       (lambda: kinds("- $x^*$ a\n- $y^*$ b\n") == []),
+ "fenced block ignored":          (lambda: kinds("```\nevent $(x^*, t^*)$\n```\n") == []),
+ "converted ^* does not trip 4f":  (lambda: __import__("check_md_math", fromlist=["x"]).emphasis_span_math_scan(
+                                        "**Self.** H, $`a^{*}`$, to $X = X'$ gives $`b^{*}`$: ok\n") == []),
+ "wrapped span with }_{":         (lambda: kinds("$\\sum c_{a}\n\\mathrm{Re}(Z^{a}_{r})$ has\n") == [(1, "wrapped-underscore")]),
+ "wrapped span without trap":     (lambda: kinds("$\\sum c_{a}\n\\mathrm{Re}(Z_r)$ has\n") == []),
+ "one-line }_{ left to pass 4b":  (lambda: kinds("so $Z^{a}_{r}$ here\n") == []),
+}
+bad2 = 0
+for name, ok in PARA_CASES.items():
+    r = ok()
+    bad2 += not r
+    print(("ok   " if r else "FAIL ") + name)
+print("paragraph-pass failures:", bad2)
+raise SystemExit(1 if (bad or bad2) else 0)
