@@ -18,7 +18,7 @@ incorrectly or not at all. The linter catches five classes of problems:
 |------|----------|-------------|
 | **Static** | Error | Macros GitHub's MathJax config blocks outright — `\operatorname`, `\bm`, `\href`, `\newcommand`, etc. Cause a visible "macro is not allowed" error. Also covers two preprocessor-level failures where `$...$` never reaches MathJax at all: an opening `$` glued to a hyphen or a quotation mark (`-$x$`, `"$x$`), and math sitting inside a single-delimiter emphasis span (`*text $x$ text*`) — GitHub renders markdown to HTML *before* scanning for `$...$`, so math inside the resulting `<em>` is never picked up. Both leave the dollar signs on the rendered page verbatim. |
 | **GFM** | Error/Warning | Corruption introduced by GitHub's CommonMark preprocessor before content reaches MathJax. Covers the backslash-strip (`\,` → literal comma, `\bigl\{` → delimiter error) *and* the punctuation-underscore emphasis-trap: `_` preceded by ANY punctuation (not just `}`) opens italic — `}_q`, `}_0`, `}_{`, `'_i`, `)_n` are all broken. Applies only to `$...$` / `$$...$$` — fenced ` ```math ` and `` $`...`$ `` (backtick-dollar) are both exempt. |
-| **Structural** | Error | Multi-line `$$...$$` blocks inside list items. GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. |
+| **Structural** | Error | (1) Multi-line `$$...$$` blocks inside list items: GitHub silently re-tokenises the indented content as nested bullet items — no error, just garbled output. (2) A ` ```math ` fence inside a **list that already has inline math**: GitHub shows it as raw code. (3) A `` $`...`$ `` span wrapped onto a line that starts with a block marker (`-`, `+`, `*`, `1.`, `#`): markdown ends the paragraph there and the whole span shows as code. |
 | **KaTeX** | Error | Every expression rendered by KaTeX in strict mode *after* applying the CommonMark strip, so the engine sees exactly what GitHub feeds its renderer. |
 | **MathJax** | Error | Same expressions through MathJax 3 with only `base` + `ams` packages — matching GitHub's actual config. Catches macros like `\thickspace` / `\medspace` that a full MathJax install would silently accept. |
 
@@ -181,12 +181,14 @@ A `$$...$$` block that spans multiple lines inside a Markdown list item is
 silently misinterpreted — GitHub re-tokenises the indented content as nested
 bullets. Fix options in order of preference:
 
-1. **Use a ` ```math ` fenced block** — fenced blocks are recognised inside
-   list items even when split over multiple lines (the preferred fix when the
-   equation is complex).
+1. **Write the equation as inline `` $`...`$ `` spans** joined by prose
+   ("... which equals ..."). This always works.
 2. **Collapse to a single line**: `` $$E = mc^2$$ ``
 3. **Use `aligned` on one line**: `$$\begin{aligned} ... \\ ... \end{aligned}$$`
 4. **Move the block out of the list** entirely.
+5. **Use a ` ```math ` fenced block** — but only if the list has no inline
+   math anywhere before it. A fence in a list that already has inline math
+   renders as raw code (see *Render probes* below).
 
 The linter's **structural pass** detects this and suggests the fixes above.
 
@@ -210,16 +212,34 @@ Two reasons to prefer the fenced form:
    sized-delimiter braces are clearer with `\,` `\;` `\bigl\{` than with
    `\thinspace` `\\;` `\bigl\lbrace`. Switch to a fenced block and write
    natural TeX.
-2. **Awkward Markdown context** — fenced blocks survive list-item nesting,
-   blockquote nesting, and `<details>` better than `$$...$$`. The structural
-   pass already suggests this as one fix when a multi-line `$$` block is
-   inside a list item.
+2. **Awkward Markdown context** — a fence is safer than a multi-line `$$`
+   block in a blockquote or beside list markers, **except inside a list that
+   has inline math**, where it renders as raw code (see *Render probes*
+   below).
 
 Trade-offs: extra surrounding syntax, display-only (no inline use), and
 visual diff churn if switching a long-established `$$...$$` block.
 
 The linter applies the static pass (blocked macros) and both render passes to
 fenced content, but **skips the GFM pass** — fenced math is exempt by design.
+
+### Render probes (2026-10-04)
+
+Ten fenced blocks in the WPMW docs showed up as raw code. Pasting minimal
+cases into a GitHub comment's *Preview* tab isolated the cause:
+
+| Construct | Result |
+|---|---|
+| ` ```math ` fence at top level, with or without a blank line before it | typesets |
+| fence in a list item or blockquote, no inline math in the list | typesets |
+| fence in a blockquote, with inline math before it | typesets |
+| fence in a list item, content like `\;` and `\thinspace`, no inline math | typesets |
+| single-line or multi-line `$$` in a blockquote; single-line `$$` in a list | typesets |
+| **fence in a list that has inline math earlier in it** (same item or an earlier item) | **raw code** |
+
+Neither nesting nor a missing blank line is the cause by itself. The case
+"inline math appears only *after* the fence" was not tested, so it is not
+flagged. `python test_check_md_math_structural.py` runs the cases.
 
 ### Additional tips
 
@@ -345,6 +365,7 @@ No third-party Python packages are required.
 
 ```
 check_md_math.py              # The linter — single self-contained file
+test_check_md_math_structural.py  # Regression cases for the structural rules
 .github/
   workflows/
     check_md_math.yml         # GitHub Actions CI workflow

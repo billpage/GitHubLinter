@@ -6,12 +6,14 @@ on:
     paths:
       - "**.md"
       - "check_md_math.py"
+      - "test_check_md_math_structural.py"
       - ".github/workflows/check_md_math.yml"
   pull_request:
     branches: [main]
     paths:
       - "**.md"
       - "check_md_math.py"
+      - "test_check_md_math_structural.py"
       - ".github/workflows/check_md_math.yml"
 
 jobs:
@@ -30,6 +32,9 @@ jobs:
 
       - name: Install npm render engines
         run: npm install --no-save katex mathjax-full
+
+      - name: Run structural-rule regression tests
+        run: python test_check_md_math_structural.py
 
       - name: Run markdown math linter
         run: python check_md_math.py README.md references/

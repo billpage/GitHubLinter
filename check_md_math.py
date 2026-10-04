@@ -56,6 +56,16 @@ on GitHub:
    then re-tokenises the indented ``+`` / ``-`` lines as nested bullet items.
    No error message — just garbled output.
 
+   Two more structural rules (added 2026-10-04, from render probes on
+   GitHub; see the README): a ``\`\`\`math`` fence inside a *list that
+   already has inline math* renders as raw code
+   (:func:`fence_after_inline_math_in_list_item`), whereas the same fence in a
+   blockquote, at top level, or in a list without inline math typesets; and a
+   wrapped ``$\`...\`$`` span whose continuation line starts with a block
+   marker (``-``, ``+``, ``*``, ``1.``, ``#``) is cut by markdown, so the
+   whole expression shows as code
+   (:func:`math_span_split_by_block_marker`).
+
 4. **Render (KaTeX, optional)** — every expression is fed to KaTeX in strict
    mode *after* applying GitHub's CommonMark backslash-strip transformation,
    so the engine sees what GitHub actually feeds the renderer rather than
@@ -914,9 +924,11 @@ def list_item_block_math(text: str) -> list[tuple[int, str, str]]:
                             "GitHub will not recognise it as math. Fix: "
                             "collapse to a single line, "
                             r"or use $$\begin{aligned}...\end{aligned}$$ on one line, "
-                            "or rewrite as a ```math fenced code block "
-                            "(which is recognised inside list items), "
-                            "or move the block out of the list.",
+                            "or write inline $`...`$ spans, "
+                            "or move the block out of the list. (A ```math "
+                            "fence also works, but only in a list with no "
+                            "inline math: see "
+                            "fence_after_inline_math_in_list_item.)",
                             snippet.replace("\n", " ↵ "),
                         ))
                         break
@@ -926,6 +938,171 @@ def list_item_block_math(text: str) -> list[tuple[int, str, str]]:
         list_indent = -1
 
     return issues
+
+
+_BQ_PREFIX = re.compile(r"^(?P<bq>(?:[ \t]*>)*)(?P<rest>.*)$")
+_FENCE_LINE = re.compile(r"^(?P<f>`{3,}|~{3,})\s*(?P<info>[^`]*)$")
+_LIST_MARKER = re.compile(r"^(?P<ind> *)(?P<mk>[-+*]|\d{1,9}[.)])(?P<sp> +)(?P<txt>\S.*)?$")
+_ANY_INLINE_MATH = re.compile(
+    r"\$`|(?<![$\\])\$(?!\$)[^$\n]+?(?<!\\)\$(?!\$)")
+# a line that starts a new block when it follows a paragraph line
+_BLOCK_START = re.compile(
+    r"^\s*(?:[-+*]\s|\d{1,9}[.)]\s|#{1,6}(?:\s|$)|=+\s*$|-{2,}\s*$|```|~~~)")
+
+
+def _scan_line(body: str, span_open: bool) -> tuple[bool, bool, str]:
+    """Tokenise one line for backtick-math spans and ordinary code spans.
+
+    Returns ``(span_open, saw_math, clean)``: whether a ``$`...`$`` math span
+    is still open at end of line, whether any math opened or was open on the
+    line, and the line with ordinary code spans blanked.
+    """
+    out: list[str] = []
+    saw = span_open
+    i, n = 0, len(body)
+    while i < n:
+        if span_open:
+            k = body.find("`$", i)
+            if k < 0:
+                out.append(body[i:])
+                i = n
+            else:
+                out.append(body[i:k + 2])
+                i, span_open = k + 2, False
+        elif body.startswith("$`", i):
+            span_open, saw = True, True
+            out.append("$`")
+            i += 2
+        elif body[i] == "`":
+            j = i
+            while j < n and body[j] == "`":
+                j += 1
+            run = body[i:j]
+            k = body.find(run, j)
+            while k >= 0 and k + len(run) < n and body[k + len(run)] == "`":
+                k = body.find(run, k + 1)
+            if k < 0:
+                out.append(run)
+                i = j
+            else:
+                out.append(" " * (k + len(run) - i))
+                i = k + len(run)
+        else:
+            out.append(body[i])
+            i += 1
+    return span_open, saw, "".join(out)
+
+
+def _split_bq(line: str) -> tuple[int, str]:
+    """Return (blockquote depth, text after the ``>`` markers)."""
+    m = _BQ_PREFIX.match(line)
+    depth = m.group("bq").count(">")
+    rest = m.group("rest")
+    if depth and rest.startswith(" "):
+        rest = rest[1:]
+    return depth, rest
+
+
+def fence_after_inline_math_in_list_item(text: str) -> list[tuple[int, str, str]]:
+    """Find ``\`\`\`math`` fences nested in a list that already has inline math.
+
+    Returns ``(line_no, message, snippet)``. On 2026-10-04 GitHub showed a
+    fence as raw code exactly when it sat inside a *list* with inline math
+    earlier in that list: render probe cases J and K, and §0 item 3 of
+    ``poisson_kicks_and_pair_branching.md``, whose own item had no math but
+    whose items 1 and 2 did. The same fence in a blockquote, at top level
+    or in a list with no inline math typesets (probe cases A-G, L-N), and so
+    does a ``$$`` block (H, I, O). Blockquote depth is tracked, so a list
+    inside a quote is still a list.
+    """
+    out: list[tuple[int, str, str]] = []
+    lists: list[list] = []   # [bq_depth, marker_indent, content_indent, has_math]
+    open_fence: tuple[str, int] | None = None
+    for no, line in enumerate(text.splitlines(), start=1):
+        depth, body = _split_bq(line)
+        stripped = body.strip()
+        if open_fence is not None:
+            ch, n = open_fence
+            if stripped and set(stripped) == {ch} and len(stripped) >= n:
+                open_fence = None
+            continue
+        if not stripped:
+            continue
+        indent = len(body) - len(body.lstrip(" "))
+        lm = _LIST_MARKER.match(body)
+        while lists and lists[-1][0] > depth:
+            lists.pop()
+        while (lists and lists[-1][0] == depth and indent < lists[-1][2]
+               and not (lm and indent == lists[-1][1])):
+            lists.pop()
+        if lm:
+            ci = indent + len(lm.group("mk")) + len(lm.group("sp"))
+            if lists and lists[-1][0] == depth and lists[-1][1] == indent:
+                lists[-1][2] = ci                      # next sibling item
+            else:
+                lists.append([depth, indent, ci, False])
+            _, saw, clean = _scan_line(lm.group("txt") or "", False)
+            if saw or _ANY_INLINE_MATH.search(clean):
+                lists[-1][3] = True
+            continue
+        fm = _FENCE_LINE.match(stripped)
+        if fm:
+            open_fence = (fm.group("f")[0], len(fm.group("f")))
+            info = fm.group("info").strip().split(" ")[0]
+            if info == "math" and any(L[3] for L in lists):
+                out.append((no,
+                            "```math fence inside a list that already has "
+                            "inline math: GitHub renders it as raw code "
+                            "(render probe cases J, K, 2026-10-04). Fix: write "
+                            "the equation as inline $`...`$ spans, or close the "
+                            "list and put the display at the top level.",
+                            stripped[:60]))
+            continue
+        if lists:
+            _, saw, clean = _scan_line(body, False)
+            if saw or _ANY_INLINE_MATH.search(clean):
+                for L in lists:
+                    L[3] = True
+    return out
+
+
+def math_span_split_by_block_marker(text: str) -> list[tuple[int, str, str]]:
+    """Find backtick-math spans continued onto a line that opens a new block.
+
+    A multi-line ``$`...`$`` span whose continuation line begins with
+    ``- ``, ``+ ``, ``* ``, ``1. ``, ``#``, a setext underline or a fence is
+    cut by markdown: the line becomes a list item, heading or fence, the
+    span never closes, and the whole expression shows as code. A minus sign
+    at the start of a wrapped line is the usual culprit (2026-10-04,
+    Theorem C9 and Lemma T1). Fix: re-wrap so the line starts with another
+    token, or put the span on one line.
+    """
+    out: list[tuple[int, str, str]] = []
+    in_fence = False
+    span_open = False
+    for no, line in enumerate(text.splitlines(), start=1):
+        _, body = _split_bq(line)
+        if re.match(r"^\s*(```|~~~)", body):
+            in_fence = not in_fence
+            span_open = False
+            continue
+        if in_fence:
+            continue
+        if not body.strip():
+            span_open = False
+            continue
+        if span_open and _BLOCK_START.match(body):
+            out.append((no,
+                        "A `$`...`$` math span continues onto this line, which "
+                        "starts with a block marker; markdown ends the "
+                        "paragraph here and the span renders as code. Re-wrap "
+                        "the line so it does not start with `-`, `+`, `*`, "
+                        "`N.` or `#`.",
+                        body.strip()[:60]))
+            span_open = False
+        # walk the line's `$` ... `$ delimiters to update the open/closed state
+        span_open, _, _ = _scan_line(body, span_open)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1122,6 +1299,10 @@ def scan_paths(paths: Iterable[Path],
         # structural pass works on the raw text
         for line, msg, snippet in list_item_block_math(text):
             issues.append(Issue(md, line, "STRUCT", "display", snippet, msg))
+        for line, msg, snippet in fence_after_inline_math_in_list_item(text):
+            issues.append(Issue(md, line, "STRUCT", "display", snippet, msg))
+        for line, msg, snippet in math_span_split_by_block_marker(text):
+            issues.append(Issue(md, line, "STRUCT", "inline", snippet, msg))
         for line, expr in unclosed_backtick_math_scan(text):
             msg = (
                 f"Backtick-math span `{expr}` is missing its closing `$`. "
